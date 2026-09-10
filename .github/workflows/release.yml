@@ -16,6 +16,9 @@ permissions:
   contents: write
   id-token: write
 
+env:
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+
 jobs:
   linux:
     name: Wheels (Linux - ${{ matrix.target }})
@@ -30,6 +33,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: PyO3/maturin-action@v1
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           target: ${{ matrix.target }}
           manylinux: auto
@@ -53,6 +58,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: PyO3/maturin-action@v1
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
@@ -79,6 +86,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: PyO3/maturin-action@v1
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
@@ -94,6 +103,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           command: sdist
           args: --out dist
