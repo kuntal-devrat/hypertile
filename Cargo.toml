@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "hypertile-core",
+    "hypertile-sys",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
+

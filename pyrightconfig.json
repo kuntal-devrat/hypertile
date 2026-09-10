@@ -1,0 +1,6 @@
+{
+  "include": ["python", "tests", "examples", "benches", "showcase"],
+  "extraPaths": ["python"],
+  "venvPath": ".",
+  "venv": ".venv"
+}

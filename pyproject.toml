@@ -1,0 +1,40 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hypertile"
+version = "0.1.0"
+description = "A shared, work-stealing executor for free-threaded Python coroutines and Send Rust futures"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Hypertile Contributors" }]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Framework :: AsyncIO",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "hypertile-sys/Cargo.toml"
+module-name = "hypertile._hypertile_sys"
+python-source = "python"
+include = ["python/hypertile/py.typed", "python/hypertile/__init__.pyi", "python/hypertile/_hypertile_sys.pyi"]
+
+[tool.pyright]
+include = ["python", "tests", "examples", "benches", "showcase"]
+extraPaths = ["python"]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+exclude = [".venv*", "target"]

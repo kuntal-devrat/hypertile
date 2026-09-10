@@ -1,0 +1,23 @@
+[package]
+name = "hypertile-core"
+version = "0.1.0"
+edition = "2021"
+description = "Hypertile shared work-stealing executor (Phase 1 core crate)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/hypertile"
+
+[dependencies]
+crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
+parking_lot = "0.12"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+thiserror = "2.0"
+rand = "0.8"
+
+[dev-dependencies]
+futures-lite = "2.6"
+
+[[bench]]
+name = "bench_queue"
+harness = false
