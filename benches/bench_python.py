@@ -25,7 +25,9 @@ def bench_hop(chain_depth: int = 5_000) -> None:
             val = await step(val)
         elapsed = time.perf_counter() - start
         per_hop_us = (elapsed / chain_depth) * 1_000_000
-        print(f"[bench_hop] {chain_depth:,} chained awaits completed in {elapsed*1000:.2f} ms ({per_hop_us:.2f} µs/hop)")
+        print(
+            f"[bench_hop] {chain_depth:,} chained awaits completed in {elapsed * 1000:.2f} ms ({per_hop_us:.2f} µs/hop)"
+        )
 
     asyncio.run(main())
 
@@ -48,7 +50,9 @@ def bench_mixed(total_tasks: int = 10_000) -> None:
         await asyncio.gather(*tasks)
         elapsed = time.perf_counter() - start
         throughput = total_tasks / elapsed
-        print(f"[bench_mixed] {total_tasks:,} colocated tasks completed in {elapsed*1000:.2f} ms ({throughput:,.0f} req/s)")
+        print(
+            f"[bench_mixed] {total_tasks:,} colocated tasks completed in {elapsed * 1000:.2f} ms ({throughput:,.0f} req/s)"
+        )
 
     asyncio.run(main())
 
@@ -59,7 +63,7 @@ def bench_steal(batch_size: int = 10_000) -> None:
         # Step while idle
         worker.run_until_idle()
     elapsed = time.perf_counter() - start
-    print(f"[bench_steal] Worker registration & teardown in {elapsed*1000:.2f} ms")
+    print(f"[bench_steal] Worker registration & teardown in {elapsed * 1000:.2f} ms")
 
 
 if __name__ == "__main__":

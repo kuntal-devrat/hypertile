@@ -84,14 +84,23 @@ impl TimerDriver {
         while !state.shutdown {
             let now = Instant::now();
 
-            // Wake all expired timers
+            // Collect all expired timers without holding the lock during wake()
+            let mut expired = Vec::new();
             while let Some(entry) = state.heap.peek() {
                 if entry.deadline <= now {
                     let entry = state.heap.pop().unwrap();
-                    entry.waker.wake();
+                    expired.push(entry.waker);
                 } else {
                     break;
                 }
+            }
+
+            if !expired.is_empty() {
+                drop(state);
+                for waker in expired {
+                    waker.wake();
+                }
+                state = self.state.lock();
             }
 
             if state.shutdown {
@@ -139,6 +148,13 @@ fn get_timer_driver() -> &'static Arc<TimerDriver> {
     unsafe { &*GLOBAL_TIMER_PTR }
 }
 
+/// Shut down the global timer subsystem.
+pub fn shutdown_timer() {
+    if GLOBAL_TIMER.state().done() {
+        get_timer_driver().shutdown();
+    }
+}
+
 /// Asynchronous sleep future.
 pub struct Sleep {
     deadline: Instant,
@@ -170,9 +186,6 @@ impl Future for Sleep {
             if !self.registered {
                 get_timer_driver().register(self.deadline, cx.waker().clone());
                 self.registered = true;
-            } else {
-                // If woken early before deadline, re-register to guarantee we don't hang
-                get_timer_driver().register(self.deadline, cx.waker().clone());
             }
             Poll::Pending
         }

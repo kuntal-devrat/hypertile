@@ -132,6 +132,7 @@ where
 /// Shut down the global shared runtime.
 pub fn shutdown() {
     global_runtime().shutdown();
+    crate::timer::shutdown_timer();
 }
 
 struct BlockingWaker(Unparker);

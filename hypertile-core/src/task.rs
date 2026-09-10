@@ -173,23 +173,41 @@ impl<T: Send + 'static> Runnable for TaskCell<T> {
 
             match poll_result {
                 Ok(Poll::Ready(output)) => {
-                    *self.result.lock() = Some(Ok(output));
-                    self.state.store(STATE_COMPLETED, Ordering::Release);
-                    // Drop future immediately to release its resources
                     drop(fut);
+                    *future_slot = None;
+                    drop(future_slot);
 
-                    // Single-hop handoff: wake any continuation awaiting this join handle!
-                    if let Some(join_waker) = self.join_waker.lock().take() {
-                        join_waker.wake();
+                    let mut prev_res = self.result.lock();
+                    let prev_state = self.state.swap(STATE_COMPLETED, Ordering::AcqRel);
+                    if prev_state != STATE_COMPLETED {
+                        *prev_res = Some(Ok(output));
+                        drop(prev_res);
+
+                        // Single-hop handoff: wake any continuation awaiting this join handle!
+                        if let Some(join_waker) = self.join_waker.lock().take() {
+                            join_waker.wake();
+                        }
                     }
                 }
                 Ok(Poll::Pending) => {
+                    // Put future back FIRST before modifying state to eliminate data race
+                    *future_slot = Some(fut);
+                    drop(future_slot);
+
                     // Check if task was cancelled while polling, or woke itself
                     loop {
                         let curr = self.state.load(Ordering::Acquire);
                         if curr == STATE_COMPLETED {
                             // Task was cancelled during poll: drop future and do not reschedule
-                            drop(fut);
+                            *self.future.lock() = None;
+                            break;
+                        }
+                        if curr == STATE_SCHEDULED {
+                            // Task woke itself during poll! Keep state as STATE_SCHEDULED and enqueue
+                            let handle = TaskHandle::new(self.clone());
+                            if !crate::waker::try_single_hop_push(handle.clone()) {
+                                self.scheduler.schedule(handle);
+                            }
                             break;
                         }
                         if self
@@ -197,24 +215,24 @@ impl<T: Send + 'static> Runnable for TaskCell<T> {
                             .compare_exchange_weak(curr, STATE_IDLE, Ordering::AcqRel, Ordering::Acquire)
                             .is_ok()
                         {
-                            *future_slot = Some(fut);
-                            if curr == STATE_SCHEDULED {
-                                let handle = TaskHandle::new(self.clone());
-                                if !crate::waker::try_single_hop_push(handle.clone()) {
-                                    self.scheduler.schedule(handle);
-                                }
-                            }
                             break;
                         }
                     }
                 }
                 Err(panic_payload) => {
-                    *self.result.lock() = Some(Err(JoinError::Panicked(panic_payload)));
-                    self.state.store(STATE_COMPLETED, Ordering::Release);
                     drop(fut);
+                    *future_slot = None;
+                    drop(future_slot);
 
-                    if let Some(join_waker) = self.join_waker.lock().take() {
-                        join_waker.wake();
+                    let mut prev_res = self.result.lock();
+                    let prev_state = self.state.swap(STATE_COMPLETED, Ordering::AcqRel);
+                    if prev_state != STATE_COMPLETED {
+                        *prev_res = Some(Err(JoinError::Panicked(panic_payload)));
+                        drop(prev_res);
+
+                        if let Some(join_waker) = self.join_waker.lock().take() {
+                            join_waker.wake();
+                        }
                     }
                 }
             }

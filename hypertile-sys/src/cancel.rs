@@ -12,6 +12,12 @@ pub struct PyCancellationToken {
     inner: Arc<AtomicBool>,
 }
 
+impl Default for PyCancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[pymethods]
 impl PyCancellationToken {
     #[new]

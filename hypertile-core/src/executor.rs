@@ -37,14 +37,22 @@ pub struct WorkerEntry {
     pub unparker: Unparker,
 }
 
+type StealersList = Arc<Vec<(WorkerId, Stealer<TaskHandle>)>>;
+
 /// Registry of all active workers and idle tracking.
 /// Uses CachePadded on hot atomics and locks to eliminate cross-core cache-line bouncing.
 pub struct WorkerRegistry {
     workers: RwLock<HashMap<WorkerId, WorkerEntry>>,
     idle_stack: CachePadded<RwLock<Vec<WorkerId>>>,
     idle_count: CachePadded<AtomicUsize>,
-    stealers_cache: CachePadded<RwLock<Arc<Vec<Stealer<TaskHandle>>>>>,
+    stealers_cache: CachePadded<RwLock<StealersList>>,
     next_id: AtomicUsize,
+}
+
+impl Default for WorkerRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkerRegistry {
@@ -83,14 +91,14 @@ impl WorkerRegistry {
         idle.retain(|&w_id| w_id != id);
         let removed = len_before - idle.len();
         if removed > 0 {
-            self.idle_count.fetch_sub(removed, Ordering::Relaxed);
+            self.idle_count.fetch_sub(removed, Ordering::Release);
         }
     }
 
     fn rebuild_stealers_cache(&self, workers: &HashMap<WorkerId, WorkerEntry>) {
         let mut list = Vec::with_capacity(workers.len());
         for entry in workers.values() {
-            list.push(entry.stealer.clone());
+            list.push((entry.id, entry.stealer.clone()));
         }
         *self.stealers_cache.write() = Arc::new(list);
     }
@@ -100,7 +108,7 @@ impl WorkerRegistry {
         let mut idle = self.idle_stack.write();
         if !idle.contains(&id) {
             idle.push(id);
-            self.idle_count.fetch_add(1, Ordering::Relaxed);
+            self.idle_count.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -111,27 +119,25 @@ impl WorkerRegistry {
         idle.retain(|&w_id| w_id != id);
         let removed = len_before - idle.len();
         if removed > 0 {
-            self.idle_count.fetch_sub(removed, Ordering::Relaxed);
+            self.idle_count.fetch_sub(removed, Ordering::Release);
         }
     }
 
     /// Unpark one idle worker if available.
     pub fn unpark_one_idle(&self) -> bool {
         // Fast-path: if no workers are idle, avoid acquiring idle_stack write lock
-        if self.idle_count.load(Ordering::Relaxed) == 0 {
+        if self.idle_count.load(Ordering::Acquire) == 0 {
             return false;
         }
 
-        let id_opt = {
+        while let Some(id) = {
             let mut idle = self.idle_stack.write();
             let popped = idle.pop();
             if popped.is_some() {
-                self.idle_count.fetch_sub(1, Ordering::Relaxed);
+                self.idle_count.fetch_sub(1, Ordering::Release);
             }
             popped
-        };
-
-        if let Some(id) = id_opt {
+        } {
             let workers = self.workers.read();
             if let Some(entry) = workers.get(&id) {
                 entry.unparker.unpark();
@@ -150,7 +156,7 @@ impl WorkerRegistry {
     }
 
     /// Returns a cached Arc reference of all active stealers for zero-allocation work-stealing.
-    pub fn get_stealers(&self) -> Arc<Vec<Stealer<TaskHandle>>> {
+    pub fn get_stealers(&self) -> Arc<Vec<(WorkerId, Stealer<TaskHandle>)>> {
         self.stealers_cache.read().clone()
     }
 

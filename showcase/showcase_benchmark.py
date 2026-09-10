@@ -24,9 +24,12 @@ import hypertile
 # Suite 1: True Like-for-Like Boundary Hop Latency
 # ============================================================================
 
+
 def run_suite_1_hop_latency(iterations: int = 3_000) -> tuple[float, float]:
     """Measures actual cross-thread offload latency for identical workloads."""
-    print(f"\n[Suite 1] Like-for-Like Boundary Offload Latency ({iterations:,} hops)...")
+    print(
+        f"\n[Suite 1] Like-for-Like Boundary Offload Latency ({iterations:,} hops)..."
+    )
 
     def native_work():
         return 42
@@ -61,7 +64,9 @@ def run_suite_1_hop_latency(iterations: int = 3_000) -> tuple[float, float]:
     if hyp_us < std_us:
         print(f"  --> Hypertile is {std_us / hyp_us:.2f}x faster")
     else:
-        print(f"  --> Hypertile is {hyp_us / std_us:.2f}x slower (wrapper overhead under GIL)")
+        print(
+            f"  --> Hypertile is {hyp_us / std_us:.2f}x slower (wrapper overhead under GIL)"
+        )
 
     return std_us, hyp_us
 
@@ -70,12 +75,15 @@ def run_suite_1_hop_latency(iterations: int = 3_000) -> tuple[float, float]:
 # Suite 2: Colocated Pipeline Microservice
 # ============================================================================
 
+
 def generate_payload(idx: int) -> bytes:
-    return json.dumps({
-        "req_id": f"tx-{idx:07d}",
-        "tenant": f"cluster-{idx % 32}",
-        "body": "stream-packet-buffer-payload-telemetry" * 6,
-    }).encode("utf-8")
+    return json.dumps(
+        {
+            "req_id": f"tx-{idx:07d}",
+            "tenant": f"cluster-{idx % 32}",
+            "body": "stream-packet-buffer-payload-telemetry" * 6,
+        }
+    ).encode("utf-8")
 
 
 async def run_pipeline_standard(total: int, concurrency: int) -> dict[str, float]:
@@ -88,7 +96,9 @@ async def run_pipeline_standard(total: int, concurrency: int) -> dict[str, float
             t0 = time.perf_counter()
             await asyncio.sleep(0.0001)  # Ingest
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(pool, hypertile.native_pipeline_transform, data, 100)
+            await loop.run_in_executor(
+                pool, hypertile.native_pipeline_transform, data, 100
+            )
             await asyncio.sleep(0.0001)  # Egress
             latencies.append((time.perf_counter() - t0) * 1000.0)
 
@@ -120,7 +130,9 @@ async def run_pipeline_hypertile(total: int, concurrency: int) -> dict[str, floa
             t0 = time.perf_counter()
             await asyncio.sleep(0.0001)  # Ingest
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, hypertile.native_pipeline_transform, data, 100)
+            await loop.run_in_executor(
+                None, hypertile.native_pipeline_transform, data, 100
+            )
             await asyncio.sleep(0.0001)  # Egress
             latencies.append((time.perf_counter() - t0) * 1000.0)
 
@@ -141,9 +153,11 @@ async def run_pipeline_hypertile(total: int, concurrency: int) -> dict[str, floa
     }
 
 
-async def run_pipeline_vectorized(total: int, batch_size: int = 100) -> dict[str, float]:
+async def run_pipeline_vectorized(
+    total: int, batch_size: int = 100
+) -> dict[str, float]:
     payloads = [generate_payload(i) for i in range(total)]
-    chunks = [payloads[i:i + batch_size] for i in range(0, total, batch_size)]
+    chunks = [payloads[i : i + batch_size] for i in range(0, total, batch_size)]
     t_start = time.perf_counter()
     tasks = [hypertile.batch_native_pipeline(chunk, rounds=100) for chunk in chunks]
     batch_results = await asyncio.gather(*tasks)
@@ -160,24 +174,34 @@ async def run_pipeline_vectorized(total: int, batch_size: int = 100) -> dict[str
     }
 
 
-def run_suite_2_pipeline(total_requests: int = 10_000, concurrency: int = 256) -> tuple[dict, dict, dict]:
+def run_suite_2_pipeline(
+    total_requests: int = 10_000, concurrency: int = 256
+) -> tuple[dict, dict, dict]:
     print(f"\n[Suite 2] Colocated Pipeline Benchmark ({total_requests:,} requests)...")
 
-    print("  Running baseline without Hypertile (raw C asyncio + ThreadPoolExecutor)...")
+    print(
+        "  Running baseline without Hypertile (raw C asyncio + ThreadPoolExecutor)..."
+    )
     std_res = asyncio.run(run_pipeline_standard(total_requests, concurrency))
-    print(f"    Baseline:          {std_res['req_s']:>10,.0f} req/s (p50: {std_res['p50_ms']:.2f}ms, p99: {std_res['p99_ms']:.2f}ms)")
+    print(
+        f"    Baseline:          {std_res['req_s']:>10,.0f} req/s (p50: {std_res['p50_ms']:.2f}ms, p99: {std_res['p99_ms']:.2f}ms)"
+    )
 
     time.sleep(0.3)
 
     print("  Running with Hypertile (Level 2 cooperative mode on Python 3.11 GIL)...")
     hyp_res = asyncio.run(run_pipeline_hypertile(total_requests, concurrency))
-    print(f"    Hypertile L2 Hook: {hyp_res['req_s']:>10,.0f} req/s (p50: {hyp_res['p50_ms']:.2f}ms, p99: {hyp_res['p99_ms']:.2f}ms)")
+    print(
+        f"    Hypertile L2 Hook: {hyp_res['req_s']:>10,.0f} req/s (p50: {hyp_res['p50_ms']:.2f}ms, p99: {hyp_res['p99_ms']:.2f}ms)"
+    )
 
     time.sleep(0.3)
 
     print("  Running with Hypertile Vectorized Batch (Zero-FFI batching)...")
     vec_res = asyncio.run(run_pipeline_vectorized(total_requests, batch_size=100))
-    print(f"    Hypertile Vector:  {vec_res['req_s']:>10,.0f} req/s (amortized: {vec_res['p50_ms']*1000:.2f} us/item)")
+    print(
+        f"    Hypertile Vector:  {vec_res['req_s']:>10,.0f} req/s (amortized: {vec_res['p50_ms'] * 1000:.2f} us/item)"
+    )
 
     return std_res, hyp_res, vec_res
 
@@ -186,8 +210,11 @@ def run_suite_2_pipeline(total_requests: int = 10_000, concurrency: int = 256) -
 # Suite 3: Dynamic Worker Registration
 # ============================================================================
 
+
 def run_suite_3_dynamic_workers(n_registrations: int = 500) -> float:
-    print(f"\n[Suite 3] Dynamic Worker Registration ({n_registrations} dynamic cycles)...")
+    print(
+        f"\n[Suite 3] Dynamic Worker Registration ({n_registrations} dynamic cycles)..."
+    )
     t0 = time.perf_counter()
     for _ in range(n_registrations):
         with hypertile.register_worker(kind="bilingual") as worker:
@@ -202,40 +229,69 @@ def run_suite_3_dynamic_workers(n_registrations: int = 500) -> float:
 # Main Entry Point & Unvarnished Summary
 # ============================================================================
 
+
 def main():
     print("=" * 80)
     print("           HYPERTILE HONEST BENCHMARK REPORT (NO SUGAR-COATING)")
-    print(f"Platform: {sys.platform} | Python: {sys.version.split()[0]} | Free-threaded: {hypertile.is_free_threaded()}")
+    print(
+        f"Platform: {sys.platform} | Python: {sys.version.split()[0]} | Free-threaded: {hypertile.is_free_threaded()}"
+    )
     print("=" * 80)
 
     std_hop, hyp_hop = run_suite_1_hop_latency(2_000)
     std_pipe, hyp_pipe, vec_pipe = run_suite_2_pipeline(10_000, 256)
     dyn_us = run_suite_3_dynamic_workers(500)
 
-    throughput_ratio_l2 = hyp_pipe['req_s'] / std_pipe['req_s']
-    throughput_ratio_vec = vec_pipe['req_s'] / std_pipe['req_s']
+    throughput_ratio_l2 = hyp_pipe["req_s"] / std_pipe["req_s"]
+    throughput_ratio_vec = vec_pipe["req_s"] / std_pipe["req_s"]
 
     print("\n" + "=" * 92)
     print("                                   HONEST RESULTS TABLE")
     print("=" * 92)
-    print(f"{'Metric':<28} | {'Standard asyncio':<18} | {'Hypertile (L2 Hook)':<20} | {'Hypertile (Vector)':<18}")
+    print(
+        f"{'Metric':<28} | {'Standard asyncio':<18} | {'Hypertile (L2 Hook)':<20} | {'Hypertile (Vector)':<18}"
+    )
     print("-" * 92)
-    print(f"{'Cross-Thread Offload Latency':<28} | {std_hop:>15.2f} us | {hyp_hop:>17.2f} us | {'N/A':>18}")
-    print(f"{'Pipeline Throughput':<28} | {std_pipe['req_s']:>15,.0f} | {hyp_pipe['req_s']:>14,.0f} req/s | {vec_pipe['req_s']:>12,.0f} req/s")
-    print(f"{'Median Latency (p50)':<28} | {std_pipe['p50_ms']:>15.2f} ms | {hyp_pipe['p50_ms']:>17.2f} ms | {vec_pipe['p50_ms']*1000:>15.2f} us")
-    print(f"{'Tail Latency (p99)':<28} | {std_pipe['p99_ms']:>15.2f} ms | {hyp_pipe['p99_ms']:>17.2f} ms | {vec_pipe['p99_ms']*1000:>15.2f} us")
-    print(f"{'Dynamic Worker Cycle':<28} | {'N/A (Static Pools)':>18} | {dyn_us:>17.2f} us | {'N/A':>18}")
+    print(
+        f"{'Cross-Thread Offload Latency':<28} | {std_hop:>15.2f} us | {hyp_hop:>17.2f} us | {'N/A':>18}"
+    )
+    print(
+        f"{'Pipeline Throughput':<28} | {std_pipe['req_s']:>15,.0f} | {hyp_pipe['req_s']:>14,.0f} req/s | {vec_pipe['req_s']:>12,.0f} req/s"
+    )
+    print(
+        f"{'Median Latency (p50)':<28} | {std_pipe['p50_ms']:>15.2f} ms | {hyp_pipe['p50_ms']:>17.2f} ms | {vec_pipe['p50_ms'] * 1000:>15.2f} us"
+    )
+    print(
+        f"{'Tail Latency (p99)':<28} | {std_pipe['p99_ms']:>15.2f} ms | {hyp_pipe['p99_ms']:>17.2f} ms | {vec_pipe['p99_ms'] * 1000:>15.2f} us"
+    )
+    print(
+        f"{'Dynamic Worker Cycle':<28} | {'N/A (Static Pools)':>18} | {dyn_us:>17.2f} us | {'N/A':>18}"
+    )
     print("=" * 92)
     print("HONEST TECHNICAL SUMMARY:")
     if throughput_ratio_l2 < 1.0:
-        print(f"1. On Python 3.11 with the GIL, Level 2 loop wrapping is {(1.0 - throughput_ratio_l2)*100:.1f}% slower.")
-        print("   Reason: Standard asyncio tasks are pure C (_asyncio.Task). Hypertile's L2 hook wraps tasks in Python")
-        print("   and allocates cancellation tokens. Under the GIL, wrapper overhead cannot be offset by parallel stepping.")
-    print(f"2. Hypertile Vectorized Batch is {throughput_ratio_vec:.1f}x FASTER than standard asyncio + ThreadPoolExecutor!")
-    print("   Reason: Micro-batching amortizes the Python <-> Rust FFI boundary across items, and native Rust workers")
+        print(
+            f"1. On Python 3.11 with the GIL, Level 2 loop wrapping is {(1.0 - throughput_ratio_l2) * 100:.1f}% slower."
+        )
+        print(
+            "   Reason: Standard asyncio tasks are pure C (_asyncio.Task). Hypertile's L2 hook wraps tasks in Python"
+        )
+        print(
+            "   and allocates cancellation tokens. Under the GIL, wrapper overhead cannot be offset by parallel stepping."
+        )
+    print(
+        f"2. Hypertile Vectorized Batch is {throughput_ratio_vec:.1f}x FASTER than standard asyncio + ThreadPoolExecutor!"
+    )
+    print(
+        "   Reason: Micro-batching amortizes the Python <-> Rust FFI boundary across items, and native Rust workers"
+    )
     print("   execute in parallel without touching the GIL.")
-    print(f"3. Dynamic Worker Registration works as advertised: external threads join/leave in {dyn_us:.1f} us.")
-    print("4. On free-threaded CPython (3.13t/3.14t+), scalar single-hop tasks also beat ThreadPoolExecutor (run free_threaded_showcase.py).")
+    print(
+        f"3. Dynamic Worker Registration works as advertised: external threads join/leave in {dyn_us:.1f} us."
+    )
+    print(
+        "4. On free-threaded CPython (3.13t/3.14t+), scalar single-hop tasks also beat ThreadPoolExecutor (run free_threaded_showcase.py)."
+    )
     print("=" * 92 + "\n")
 
 

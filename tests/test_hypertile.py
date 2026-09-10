@@ -7,7 +7,7 @@ import pytest
 
 
 def test_version_and_exports():
-    assert hypertile.__version__ == "0.1.0"
+    assert hypertile.__version__ == "0.1.1"
     assert hasattr(hypertile, "run")
     assert hasattr(hypertile, "install")
     assert hasattr(hypertile, "register_worker")
@@ -236,4 +236,3 @@ def test_batch_empty_inputs():
         assert empty_callable == []
 
     asyncio.run(main())
-

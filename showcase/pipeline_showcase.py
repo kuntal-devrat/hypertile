@@ -35,6 +35,7 @@ def generate_mock_payload(idx: int) -> bytes:
 # Mode 1: WITHOUT Hypertile (Standard Python asyncio + ThreadPoolExecutor)
 # ============================================================================
 
+
 async def process_request_standard(
     idx: int,
     payload: bytes,
@@ -109,6 +110,7 @@ async def run_standard_suite(
 # Mode 2: WITH Hypertile (Colocated Work-Stealing Pool & Single-Hop Handoff)
 # ============================================================================
 
+
 async def process_request_hypertile(
     idx: int,
     payload: bytes,
@@ -180,29 +182,52 @@ async def run_hypertile_suite(
 # Benchmark Runner & Presentation Table
 # ============================================================================
 
+
 def print_comparison_table(
     std_res: dict[str, float],
     hyp_res: dict[str, float],
 ) -> None:
     """Print an aesthetic, high-contrast ASCII comparison table."""
-    speedup = (hyp_res["throughput_req_s"] / std_res["throughput_req_s"])
-    p50_reduction = ((std_res["p50_ms"] - hyp_res["p50_ms"]) / std_res["p50_ms"]) * 100.0
-    p99_reduction = ((std_res["p99_ms"] - hyp_res["p99_ms"]) / std_res["p99_ms"]) * 100.0
+    speedup = hyp_res["throughput_req_s"] / std_res["throughput_req_s"]
+    p50_reduction = (
+        (std_res["p50_ms"] - hyp_res["p50_ms"]) / std_res["p50_ms"]
+    ) * 100.0
+    p99_reduction = (
+        (std_res["p99_ms"] - hyp_res["p99_ms"]) / std_res["p99_ms"]
+    ) * 100.0
 
     print("\n" + "=" * 80)
     print("        HYPERTILE SHOWCASE BENCHMARK: WITH vs. WITHOUT HYPERTILE")
     print("=" * 80)
-    print(f"Total Requests: {int(std_res['total_requests']):,} | Workload: Ingest (IO) + Rust Compute + Egress (IO)")
+    print(
+        f"Total Requests: {int(std_res['total_requests']):,} | Workload: Ingest (IO) + Rust Compute + Egress (IO)"
+    )
     print("-" * 80)
-    print(f"{'Metric':<25} | {'WITHOUT Hypertile':<20} | {'WITH Hypertile':<20} | {'Delta':<12}")
+    print(
+        f"{'Metric':<25} | {'WITHOUT Hypertile':<20} | {'WITH Hypertile':<20} | {'Delta':<12}"
+    )
     print("-" * 80)
-    print(f"{'Throughput (req/s)':<25} | {std_res['throughput_req_s']:>17,.0f} | {hyp_res['throughput_req_s']:>17,.0f} | {speedup:>8.2f}x")
-    print(f"{'Wall Time (s)':<25} | {std_res['wall_time_s']:>17.3f} | {hyp_res['wall_time_s']:>17.3f} | {-((std_res['wall_time_s'] - hyp_res['wall_time_s']) / std_res['wall_time_s'])*100:>7.1f}%")
-    print(f"{'Mean Latency (ms)':<25} | {std_res['mean_ms']:>17.3f} | {hyp_res['mean_ms']:>17.3f} | {-((std_res['mean_ms'] - hyp_res['mean_ms']) / std_res['mean_ms'])*100:>7.1f}%")
-    print(f"{'p50 Latency (ms)':<25} | {std_res['p50_ms']:>17.3f} | {hyp_res['p50_ms']:>17.3f} | {-p50_reduction:>7.1f}%")
-    print(f"{'p90 Latency (ms)':<25} | {std_res['p90_ms']:>17.3f} | {hyp_res['p90_ms']:>17.3f} | {-((std_res['p90_ms'] - hyp_res['p90_ms']) / std_res['p90_ms'])*100:>7.1f}%")
-    print(f"{'p95 Latency (ms)':<25} | {std_res['p95_ms']:>17.3f} | {hyp_res['p95_ms']:>17.3f} | {-((std_res['p95_ms'] - hyp_res['p95_ms']) / std_res['p95_ms'])*100:>7.1f}%")
-    print(f"{'p99 Latency (ms)':<25} | {std_res['p99_ms']:>17.3f} | {hyp_res['p99_ms']:>17.3f} | {-p99_reduction:>7.1f}%")
+    print(
+        f"{'Throughput (req/s)':<25} | {std_res['throughput_req_s']:>17,.0f} | {hyp_res['throughput_req_s']:>17,.0f} | {speedup:>8.2f}x"
+    )
+    print(
+        f"{'Wall Time (s)':<25} | {std_res['wall_time_s']:>17.3f} | {hyp_res['wall_time_s']:>17.3f} | {-((std_res['wall_time_s'] - hyp_res['wall_time_s']) / std_res['wall_time_s']) * 100:>7.1f}%"
+    )
+    print(
+        f"{'Mean Latency (ms)':<25} | {std_res['mean_ms']:>17.3f} | {hyp_res['mean_ms']:>17.3f} | {-((std_res['mean_ms'] - hyp_res['mean_ms']) / std_res['mean_ms']) * 100:>7.1f}%"
+    )
+    print(
+        f"{'p50 Latency (ms)':<25} | {std_res['p50_ms']:>17.3f} | {hyp_res['p50_ms']:>17.3f} | {-p50_reduction:>7.1f}%"
+    )
+    print(
+        f"{'p90 Latency (ms)':<25} | {std_res['p90_ms']:>17.3f} | {hyp_res['p90_ms']:>17.3f} | {-((std_res['p90_ms'] - hyp_res['p90_ms']) / std_res['p90_ms']) * 100:>7.1f}%"
+    )
+    print(
+        f"{'p95 Latency (ms)':<25} | {std_res['p95_ms']:>17.3f} | {hyp_res['p95_ms']:>17.3f} | {-((std_res['p95_ms'] - hyp_res['p95_ms']) / std_res['p95_ms']) * 100:>7.1f}%"
+    )
+    print(
+        f"{'p99 Latency (ms)':<25} | {std_res['p99_ms']:>17.3f} | {hyp_res['p99_ms']:>17.3f} | {-p99_reduction:>7.1f}%"
+    )
     print("=" * 80)
     print(f"Outcome: Hypertile delivered a {speedup:.2f}x throughput multiplier with a")
     print(f"         {p50_reduction:.1f}% reduction in median (p50) latency and a")
@@ -214,16 +239,24 @@ def main():
     total_requests = 10_000
     concurrency = 256
 
-    print(f"\n[1/2] Running baseline: WITHOUT Hypertile ({total_requests:,} requests @ {concurrency} concurrency)...")
+    print(
+        f"\n[1/2] Running baseline: WITHOUT Hypertile ({total_requests:,} requests @ {concurrency} concurrency)..."
+    )
     std_res = asyncio.run(run_standard_suite(total_requests, concurrency))
-    print(f"      Completed in {std_res['wall_time_s']:.2f}s ({std_res['throughput_req_s']:,.0f} req/s, p50: {std_res['p50_ms']:.2f}ms, p99: {std_res['p99_ms']:.2f}ms)")
+    print(
+        f"      Completed in {std_res['wall_time_s']:.2f}s ({std_res['throughput_req_s']:,.0f} req/s, p50: {std_res['p50_ms']:.2f}ms, p99: {std_res['p99_ms']:.2f}ms)"
+    )
 
     # Short cool down between runs
     time.sleep(1.0)
 
-    print(f"\n[2/2] Running optimized: WITH Hypertile ({total_requests:,} requests @ {concurrency} concurrency)...")
+    print(
+        f"\n[2/2] Running optimized: WITH Hypertile ({total_requests:,} requests @ {concurrency} concurrency)..."
+    )
     hyp_res = asyncio.run(run_hypertile_suite(total_requests, concurrency))
-    print(f"      Completed in {hyp_res['wall_time_s']:.2f}s ({hyp_res['throughput_req_s']:,.0f} req/s, p50: {hyp_res['p50_ms']:.2f}ms, p99: {hyp_res['p99_ms']:.2f}ms)")
+    print(
+        f"      Completed in {hyp_res['wall_time_s']:.2f}s ({hyp_res['throughput_req_s']:,.0f} req/s, p50: {hyp_res['p50_ms']:.2f}ms, p99: {hyp_res['p99_ms']:.2f}ms)"
+    )
 
     print_comparison_table(std_res, hyp_res)
 

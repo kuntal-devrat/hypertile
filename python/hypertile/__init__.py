@@ -11,6 +11,7 @@ Key Interfaces:
 
 # pyright: reportAssignmentType=false
 import functools
+import inspect
 import sys
 from collections.abc import Callable, Coroutine, Iterable, Sequence
 from typing import Any, TypeVar
@@ -55,69 +56,72 @@ try:
         spawn_native_pipeline as _spawn_native_pipeline,
     )
 except ImportError:
-        # Graceful fallback if native extension is not yet built
-        def _is_free_threaded() -> bool:
-            return not getattr(sys, "_is_gil_enabled", lambda: True)()
+    # Graceful fallback if native extension is not yet built
+    def _is_free_threaded() -> bool:
+        return not getattr(sys, "_is_gil_enabled", lambda: True)()
 
-        def _native_pipeline_transform(payload: bytes, rounds: int = 100) -> bytes:
-            return payload[:32]
+    def _native_pipeline_transform(payload: bytes, rounds: int = 100) -> bytes:
+        return payload[:32]
 
-        def _spawn_native_pipeline(payload: bytes, rounds: int = 100):
-            raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+    def _spawn_native_pipeline(payload: bytes, rounds: int = 100):
+        raise NotImplementedError("Native extension _hypertile_sys is not installed.")
 
-        def _batch_spawn_native_pipeline(payloads, rounds: int = 100):
-            raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+    def _batch_spawn_native_pipeline(payloads, rounds: int = 100):
+        raise NotImplementedError("Native extension _hypertile_sys is not installed.")
 
-        def _spawn_callable(func, args=None, kwargs=None):
-            raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+    def _spawn_callable(func, args=None, kwargs=None):
+        raise NotImplementedError("Native extension _hypertile_sys is not installed.")
 
-        def _batch_spawn_callable(func, args_list):
-            raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+    def _batch_spawn_callable(func, args_list):
+        raise NotImplementedError("Native extension _hypertile_sys is not installed.")
 
-        def _register_worker(kind: str = "bilingual"):
-            raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+    def _register_worker(kind: str = "bilingual"):
+        raise NotImplementedError("Native extension _hypertile_sys is not installed.")
 
-        def _spawn_coroutine(coro, done_callback=None, cancellation_token=None):
-            raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+    def _spawn_coroutine(coro, done_callback=None, cancellation_token=None):
+        raise NotImplementedError("Native extension _hypertile_sys is not installed.")
 
-        def _run_level1(coro):
-            raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+    def _run_level1(coro):
+        raise NotImplementedError("Native extension _hypertile_sys is not installed.")
 
-        class CancellationToken:
-            def __init__(self):
-                self._cancelled = False
-            def cancel(self):
-                self._cancelled = True
-            def is_cancelled(self) -> bool:
-                return self._cancelled
+    class CancellationToken:
+        def __init__(self):
+            self._cancelled = False
 
-        class RegisteredWorker:
-            pass
+        def cancel(self):
+            self._cancelled = True
 
-        class NativeTask:
-            pass
+        def is_cancelled(self) -> bool:
+            return self._cancelled
 
-        class CallableTask:
-            pass
+    class RegisteredWorker:
+        pass
 
-        class BatchNativeTask:
-            pass
+    class NativeTask:
+        pass
 
-        class BatchCallableTask:
-            pass
+    class CallableTask:
+        pass
 
-        class PanicInTask(Exception):
-            pass
+    class BatchNativeTask:
+        pass
 
-        class TaskCancelled(Exception):
-            pass
+    class BatchCallableTask:
+        pass
 
-        class RegistrationError(Exception):
-            pass
+    class PanicInTask(Exception):
+        pass
+
+    class TaskCancelled(Exception):
+        pass
+
+    class RegistrationError(Exception):
+        pass
+
 
 from .asyncio_policy import install
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = [
     "BatchCallableTask",
     "BatchNativeTask",
@@ -135,12 +139,18 @@ __all__ = [
     "native_pipeline_transform",
     "register_worker",
     "run",
+    "run_level1",
     "spawn_native_pipeline",
     "task",
     "to_thread",
 ]
 
 _T = TypeVar("_T")
+
+
+def run_level1(main_coroutine: Coroutine) -> Any:
+    """Run a coroutine directly under Hypertile's Level 1 native executor without an asyncio loop."""
+    return _run_level1(main_coroutine)
 
 
 def to_thread(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Any:
@@ -156,15 +166,18 @@ def to_thread(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Any:
     Example:
         result = await hypertile.to_thread(crypto_hash, payload, rounds=50)
     """
-    import asyncio
-    if asyncio.iscoroutinefunction(func):
-        raise TypeError("hypertile.to_thread() does not accept coroutines; use await func() directly.")
+    if inspect.iscoroutinefunction(func):
+        raise TypeError(
+            "hypertile.to_thread() does not accept coroutines; use await func() directly."
+        )
 
     try:
         args_tuple = tuple(args) if args else None
         kwargs_dict = dict(kwargs) if kwargs else None
         return _spawn_callable(func, args_tuple, kwargs_dict)
     except (NotImplementedError, NameError):
+        import asyncio
+
         return asyncio.to_thread(func, *args, **kwargs)
 
 
@@ -182,10 +195,12 @@ def task(func: Callable[..., Any] | None = None) -> Any:
         # In an async function:
         val = await compute(6, 7)
     """
+
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             return to_thread(fn, *args, **kwargs)
+
         return wrapper
 
     if func is not None:
@@ -245,17 +260,16 @@ def gather_to_thread(func: Callable[..., _T], args_iterable: Iterable[Any]) -> A
     Example:
         results = await hypertile.gather_to_thread(crypto_hash, [b"data1", b"data2", b"data3"])
     """
-    norm_args = [
-        arg if isinstance(arg, tuple) else (arg,)
-        for arg in args_iterable
-    ]
+    norm_args = [arg if isinstance(arg, tuple) else (arg,) for arg in args_iterable]
     try:
         return _batch_spawn_callable(func, norm_args)
     except (NotImplementedError, NameError):
         import asyncio
 
         async def _fallback_gather():
-            return await asyncio.gather(*(asyncio.to_thread(func, *a) for a in norm_args))
+            return await asyncio.gather(
+                *(asyncio.to_thread(func, *a) for a in norm_args)
+            )
 
         return _fallback_gather()
 
@@ -280,22 +294,20 @@ def register_worker(kind: str = "bilingual") -> RegisteredWorker:
     return _register_worker(kind)
 
 
-def run(main_coroutine: Coroutine) -> Any:
-    """Run a coroutine to completion using Hypertile's Level 1 native executor.
+def run(main_coroutine: Coroutine, *, level1: bool = False) -> Any:
+    """Run a coroutine to completion under Hypertile.
 
-    On free-threaded Python builds (3.13t/3.14t+), drives coroutines across bilingual
-    workers with single-hop continuation handoffs.
+    By default, installs Hypertile's work-stealing executor into asyncio and executes
+    via ``asyncio.run(main_coroutine)``, ensuring 100% compatibility with asyncio primitives
+    (e.g. ``asyncio.sleep``, ``httpx``, ``aiohttp``) across all Python versions including 3.13t.
 
-    On standard GIL builds, falls back to cooperative mode via asyncio loop colocated
-    with Hypertile's native pool.
+    If ``level1=True`` is specified, drives coroutines directly across bilingual native
+    workers without initializing an asyncio event loop.
     """
-    if is_free_threaded():
-        try:
-            return _run_level1(main_coroutine)
-        except NotImplementedError:
-            pass
+    if level1:
+        return _run_level1(main_coroutine)
 
-    # Cooperative mode fallback on standard GIL builds
     import asyncio
+
     install()
     return asyncio.run(main_coroutine)

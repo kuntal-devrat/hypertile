@@ -1,6 +1,6 @@
 [package]
 name = "hypertile-sys"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "PyO3 bindings and bilingual stepping engine for Hypertile"
 license = "MIT OR Apache-2.0"

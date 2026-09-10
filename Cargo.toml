@@ -2,6 +2,7 @@
 members = [
     "hypertile-core",
     "hypertile-sys",
+    "hypertile-capi",
 ]
 resolver = "2"
 

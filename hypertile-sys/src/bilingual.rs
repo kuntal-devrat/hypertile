@@ -22,6 +22,7 @@ use crate::exceptions::TaskCancelled;
 pub struct PyCoroutineTask {
     coro: Mutex<Option<Py<PyAny>>>,
     done_callback: Mutex<Option<Py<PyAny>>>,
+    pending_value: Mutex<Option<Result<Py<PyAny>, Py<PyAny>>>>,
     token: Arc<AtomicBool>,
     scheduler: Arc<ExecutorCore>,
 }
@@ -36,6 +37,7 @@ impl PyCoroutineTask {
         Arc::new(Self {
             coro: Mutex::new(Some(coro)),
             done_callback: Mutex::new(done_callback),
+            pending_value: Mutex::new(None),
             token,
             scheduler,
         })
@@ -66,13 +68,17 @@ impl Runnable for PyCoroutineTask {
                 return;
             }
 
-            // 2. Step the coroutine via send(None)
-            let step_result = coro.call_method1("send", (py.None(),));
+            // 2. Step the coroutine via send(val) or throw(exc)
+            let next_input = self.pending_value.lock().take();
+            let step_result = match next_input {
+                Some(Ok(val)) => coro.call_method1("send", (val.bind(py),)),
+                Some(Err(err)) => coro.call_method1("throw", (err.bind(py),)),
+                None => coro.call_method1("send", (py.None(),)),
+            };
 
             match step_result {
                 Ok(yielded) => {
                     // Coroutine yielded an awaitable or future.
-                    // We register a done callback to reschedule this task when ready.
                     let task_clone = self.clone();
                     let sched = self.scheduler.clone();
 
@@ -83,9 +89,22 @@ impl Runnable for PyCoroutineTask {
                             py,
                             None,
                             None,
-                            move |_args, _kwargs| {
-                                sched.inject(TaskHandle::new(task_clone.clone()));
-                                Ok::<(), PyErr>(())
+                            move |args, _kwargs| {
+                                Python::with_gil(|_py| {
+                                    if let Ok(fut) = args.get_item(0) {
+                                        if let Ok(exc) = fut.call_method0("exception") {
+                                            if !exc.is_none() {
+                                                *task_clone.pending_value.lock() = Some(Err(exc.into_any().unbind()));
+                                            } else if let Ok(res) = fut.call_method0("result") {
+                                                *task_clone.pending_value.lock() = Some(Ok(res.into_any().unbind()));
+                                            }
+                                        } else if let Ok(res) = fut.call_method0("result") {
+                                            *task_clone.pending_value.lock() = Some(Ok(res.into_any().unbind()));
+                                        }
+                                    }
+                                    sched.inject(TaskHandle::new(task_clone.clone()));
+                                    Ok::<(), PyErr>(())
+                                })
                             },
                         );
                         if let Ok(wake_py) = wake_fn {
@@ -95,7 +114,8 @@ impl Runnable for PyCoroutineTask {
                         }
                     }
                     if !hooked {
-                        // Reschedule directly
+                        // Avoid tight busy-spinning if an unsupported object yielded
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                         self.scheduler.inject(TaskHandle::new(self.clone()));
                     }
                 }

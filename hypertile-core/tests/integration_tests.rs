@@ -146,3 +146,47 @@ fn test_single_hop_continuation() {
 
     assert_eq!(res, chain_len);
 }
+
+#[test]
+fn test_self_waking_yield_now() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct YieldNow(bool);
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    let rt = Runtime::new(2);
+    let handle = rt.spawn(async {
+        YieldNow(false).await;
+        YieldNow(false).await;
+        999
+    });
+
+    let res = block_on(handle).expect("task should not hang when self-waking");
+    assert_eq!(res, 999);
+}
+
+#[test]
+fn test_reentrant_timer_wake() {
+    let rt = Runtime::new(2);
+    let handle = rt.spawn(async {
+        sleep(Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(20)).await;
+        "reentrant-ok"
+    });
+
+    let res = block_on(handle).expect("chained sleeps should succeed without deadlock");
+    assert_eq!(res, "reentrant-ok");
+}

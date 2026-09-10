@@ -21,28 +21,39 @@ class HypertileAsyncioExecutor(ThreadPoolExecutor):
     def __init__(self, max_workers: int | None = None):
         super().__init__(max_workers=max_workers or 8)
         self._shutdown = False
+        self._pending: set[ConcurrentFuture] = set()
 
     def submit(self, fn: Callable, *args, **kwargs) -> ConcurrentFuture:
         if self._shutdown:
             raise RuntimeError("cannot schedule new futures after shutdown")
 
         fut: ConcurrentFuture = ConcurrentFuture()
+        self._pending.add(fut)
+
+        def _cleanup(f):
+            self._pending.discard(f)
+
+        fut.add_done_callback(_cleanup)
 
         try:
             from . import _hypertile_sys
+
             task = _hypertile_sys.spawn_callable(
                 fn,
                 tuple(args) if args else None,
                 dict(kwargs) if kwargs else None,
             )
+
             def _on_done():
                 try:
                     res = task.result()
                     fut.set_result(res)
                 except BaseException as e:  # noqa: BLE001
                     fut.set_exception(e)
+
             task.add_done_callback(_on_done)
         except Exception:  # noqa: BLE001
+
             def wrapper():
                 try:
                     res = fn(*args, **kwargs)
@@ -51,6 +62,7 @@ class HypertileAsyncioExecutor(ThreadPoolExecutor):
                     fut.set_exception(e)
 
             import threading
+
             t = threading.Thread(target=wrapper, daemon=True)
             t.start()
 
@@ -58,6 +70,13 @@ class HypertileAsyncioExecutor(ThreadPoolExecutor):
 
     def shutdown(self, wait: bool = True, *, cancel_futures: bool = False):
         self._shutdown = True
+        if cancel_futures:
+            for f in list(self._pending):
+                f.cancel()
+        if wait and self._pending:
+            import concurrent.futures
+
+            concurrent.futures.wait(list(self._pending))
 
 
 class HypertileTask(asyncio.Task):
@@ -67,18 +86,24 @@ class HypertileTask(asyncio.Task):
         super().__init__(coro, loop=loop, name=name, context=context)
         try:
             from . import _hypertile_sys
+
             self.__hypertile_token__ = _hypertile_sys.CancellationToken()
             register_token(self.__hypertile_token__)
         except Exception:  # noqa: BLE001
             self.__hypertile_token__ = None
 
     def cancel(self, msg=None):
-        if hasattr(self, "__hypertile_token__") and self.__hypertile_token__ is not None:
+        if (
+            hasattr(self, "__hypertile_token__")
+            and self.__hypertile_token__ is not None
+        ):
             self.__hypertile_token__.cancel()
         return super().cancel(msg) if msg is not None else super().cancel()
 
 
-def hypertile_task_factory(loop: asyncio.AbstractEventLoop, coro: Coroutine, **kwargs) -> asyncio.Task:
+def hypertile_task_factory(
+    loop: asyncio.AbstractEventLoop, coro: Coroutine, **kwargs
+) -> asyncio.Task:
     """Task factory injecting cooperative cancellation tokens into asyncio Tasks."""
     return HypertileTask(coro, loop=loop, **kwargs)
 
@@ -120,6 +145,7 @@ def install() -> None:
         asyncio.set_event_loop_policy(HypertileEventLoopPolicy())  # type: ignore[deprecated]
 
     from . import is_free_threaded
+
     if not is_free_threaded():
         logger.info(
             "Hypertile: Running in cooperative mode (standard GIL Python build detected per PRD v2 §2.5)."

@@ -185,14 +185,65 @@ fn native_pipeline_transform(py: Python<'_>, payload: &[u8], rounds: usize) -> V
     py.allow_threads(move || run_crypto_pipeline(&data, rounds))
 }
 
+fn bridge_task_await<'py, T: 'static>(slf: &Bound<'py, T>) -> PyResult<Py<PyAny>> {
+    let py = slf.py();
+    if let Ok(asyncio) = py.import("asyncio") {
+        if let Ok(loop_obj) = asyncio.call_method0("get_running_loop") {
+            let fut = loop_obj.call_method0("create_future")?;
+            let fut_clone = fut.clone().unbind();
+            let loop_clone = loop_obj.clone().unbind();
+            let slf_any = slf.clone().into_any().unbind();
+
+            let cb = pyo3::types::PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |_args, _kwargs| {
+                    Python::with_gil(|py| {
+                        let loop_bound = loop_clone.bind(py);
+                        let fut_bound = fut_clone.bind(py);
+                        if let Ok(cancelled) = fut_bound.call_method0("cancelled") {
+                            if let Ok(true) = cancelled.extract::<bool>() {
+                                return Ok::<(), PyErr>(());
+                            }
+                        }
+                        let slf_bound = slf_any.bind(py);
+                        match slf_bound.call_method0("result") {
+                            Ok(val) => {
+                                let _ = loop_bound.call_method1(
+                                    "call_soon_threadsafe",
+                                    (fut_bound.getattr("set_result")?, val),
+                                );
+                            }
+                            Err(err) => {
+                                let _ = loop_bound.call_method1(
+                                    "call_soon_threadsafe",
+                                    (fut_bound.getattr("set_exception")?, err),
+                                );
+                            }
+                        }
+                        Ok::<(), PyErr>(())
+                    })
+                },
+            )?;
+
+            slf.as_any().call_method1("add_done_callback", (cb,))?;
+            let await_iter = fut.call_method0("__await__")?;
+            return Ok(await_iter.unbind());
+        }
+    }
+    Ok(slf.clone().into_any().unbind())
+}
+
 struct NativeTaskInner {
-    result: parking_lot::Mutex<Option<Vec<u8>>>,
+    result: parking_lot::Mutex<Option<Result<Vec<u8>, String>>>,
     done: AtomicBool,
-    callback: parking_lot::Mutex<Option<Py<PyAny>>>,
+    callbacks: parking_lot::Mutex<Vec<Py<PyAny>>>,
 }
 
 /// An awaitable native task handle driven directly by Hypertile's work-stealing pool.
 #[pyclass(name = "NativeTask")]
+#[derive(Clone)]
 pub struct PyNativeTask {
     inner: Arc<NativeTaskInner>,
 }
@@ -206,41 +257,41 @@ impl PyNativeTask {
     pub fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let res = self.inner.result.lock();
         match res.as_ref() {
-            Some(v) => Ok(pyo3::types::PyBytes::new(py, v).into_any().unbind()),
+            Some(Ok(v)) => Ok(pyo3::types::PyBytes::new(py, v).into_any().unbind()),
+            Some(Err(msg)) => Err(PanicInTask::new_err(msg.clone())),
             None => Err(pyo3::exceptions::PyRuntimeError::new_err("task not completed")),
         }
     }
 
     pub fn add_done_callback(&self, py: Python<'_>, cb: Py<PyAny>) -> PyResult<()> {
-        let mut cb_guard = self.inner.callback.lock();
+        let mut cb_guard = self.inner.callbacks.lock();
         if self.inner.done.load(std::sync::atomic::Ordering::Acquire) {
             drop(cb_guard);
             let _ = cb.call1(py, ());
         } else {
-            *cb_guard = Some(cb);
+            cb_guard.push(cb);
         }
         Ok(())
     }
 
-    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    fn __await__(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        bridge_task_await(&slf)
+    }
+
+    fn __iter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
         slf
     }
 
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(slf: PyRef<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
-        if slf.inner.done.load(std::sync::atomic::Ordering::Acquire) {
-            let res = slf.inner.result.lock();
-            let py = slf.py();
-            let bytes = res
-                .as_ref()
-                .map(|v| pyo3::types::PyBytes::new(py, v).into_any().unbind())
-                .unwrap_or_else(|| py.None());
-            Err(pyo3::exceptions::PyStopIteration::new_err(bytes))
+    fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        if slf.borrow().done() {
+            let res = slf.borrow().result(py);
+            match res {
+                Ok(bytes) => Err(pyo3::exceptions::PyStopIteration::new_err(bytes)),
+                Err(err) => Err(err),
+            }
         } else {
-            Ok(Some(slf.py().None()))
+            Ok(Some(py.None()))
         }
     }
 }
@@ -253,7 +304,7 @@ fn spawn_native_pipeline(payload: &[u8], rounds: usize) -> PyNativeTask {
     let inner = Arc::new(NativeTaskInner {
         result: parking_lot::Mutex::new(None),
         done: AtomicBool::new(false),
-        callback: parking_lot::Mutex::new(None),
+        callbacks: parking_lot::Mutex::new(Vec::new()),
     });
 
     let inner_clone = inner.clone();
@@ -261,14 +312,36 @@ fn spawn_native_pipeline(payload: &[u8], rounds: usize) -> PyNativeTask {
 
     let rt = global_runtime();
     rt.spawn(async move {
-        let output = run_crypto_pipeline(&data, rounds);
-        *inner_clone.result.lock() = Some(output);
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_crypto_pipeline(&data, rounds)
+        }));
+
+        match panic_res {
+            Ok(output) => {
+                *inner_clone.result.lock() = Some(Ok(output));
+            }
+            Err(panic_payload) => {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "native task panicked during execution".to_string()
+                };
+                *inner_clone.result.lock() = Some(Err(msg));
+            }
+        }
         inner_clone.done.store(true, std::sync::atomic::Ordering::Release);
 
-        let cb_opt = inner_clone.callback.lock().take();
-        if let Some(cb) = cb_opt {
+        let callbacks = {
+            let mut cb_guard = inner_clone.callbacks.lock();
+            std::mem::take(&mut *cb_guard)
+        };
+        if !callbacks.is_empty() {
             Python::with_gil(|py| {
-                let _ = cb.call1(py, ());
+                for cb in callbacks {
+                    let _ = cb.call1(py, ());
+                }
             });
         }
     });
@@ -279,11 +352,13 @@ fn spawn_native_pipeline(payload: &[u8], rounds: usize) -> PyNativeTask {
 struct BatchNativeInner {
     results: parking_lot::Mutex<Vec<Option<Vec<u8>>>>,
     remaining: std::sync::atomic::AtomicUsize,
-    callback: parking_lot::Mutex<Option<Py<PyAny>>>,
+    callbacks: parking_lot::Mutex<Vec<Py<PyAny>>>,
+    panic_error: parking_lot::Mutex<Option<String>>,
 }
 
 /// An awaitable batch of native tasks executed in parallel across Hypertile workers.
 #[pyclass(name = "BatchNativeTask")]
+#[derive(Clone)]
 pub struct PyBatchNativeTask {
     inner: Arc<BatchNativeInner>,
 }
@@ -298,6 +373,9 @@ impl PyBatchNativeTask {
         if !self.done() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err("batch task not completed"));
         }
+        if let Some(err_msg) = self.inner.panic_error.lock().as_ref() {
+            return Err(PanicInTask::new_err(err_msg.clone()));
+        }
         let guard = self.inner.results.lock();
         let py_list = pyo3::types::PyList::empty(py);
         for item in guard.iter() {
@@ -311,31 +389,34 @@ impl PyBatchNativeTask {
     }
 
     pub fn add_done_callback(&self, py: Python<'_>, cb: Py<PyAny>) -> PyResult<()> {
-        let mut cb_guard = self.inner.callback.lock();
+        let mut cb_guard = self.inner.callbacks.lock();
         if self.done() {
             drop(cb_guard);
             let _ = cb.call1(py, ());
         } else {
-            *cb_guard = Some(cb);
+            cb_guard.push(cb);
         }
         Ok(())
     }
 
-    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    fn __await__(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        bridge_task_await(&slf)
+    }
+
+    fn __iter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
         slf
     }
 
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(slf: PyRef<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
-        if slf.done() {
-            let py = slf.py();
-            let res = slf.result(py)?;
-            Err(pyo3::exceptions::PyStopIteration::new_err(res))
+    fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        if slf.borrow().done() {
+            let res = slf.borrow().result(py);
+            match res {
+                Ok(val) => Err(pyo3::exceptions::PyStopIteration::new_err(val)),
+                Err(err) => Err(err),
+            }
         } else {
-            Ok(Some(slf.py().None()))
+            Ok(Some(py.None()))
         }
     }
 }
@@ -348,7 +429,8 @@ fn batch_spawn_native_pipeline(payloads: Vec<Vec<u8>>, rounds: usize) -> PyBatch
     let inner = Arc::new(BatchNativeInner {
         results: parking_lot::Mutex::new(vec![None; total]),
         remaining: std::sync::atomic::AtomicUsize::new(total),
-        callback: parking_lot::Mutex::new(None),
+        callbacks: parking_lot::Mutex::new(Vec::new()),
+        panic_error: parking_lot::Mutex::new(None),
     });
 
     if total == 0 {
@@ -358,7 +440,7 @@ fn batch_spawn_native_pipeline(payloads: Vec<Vec<u8>>, rounds: usize) -> PyBatch
     let rt = global_runtime();
     let num_workers = rt.core().registry().active_count().max(1);
     let num_chunks = (num_workers * 4).min(total).max(1);
-    let chunk_size = (total + num_chunks - 1) / num_chunks;
+    let chunk_size = total.div_ceil(num_chunks);
 
     let payloads_arc = Arc::new(payloads);
 
@@ -373,23 +455,45 @@ fn batch_spawn_native_pipeline(payloads: Vec<Vec<u8>>, rounds: usize) -> PyBatch
         let payloads_ref = payloads_arc.clone();
 
         rt.spawn(async move {
-            let mut chunk_res = Vec::with_capacity(end - start);
-            for i in start..end {
-                let output = run_crypto_pipeline(&payloads_ref[i], rounds);
-                chunk_res.push(output);
-            }
-            let count = chunk_res.len();
-            {
-                let mut guard = inner_clone.results.lock();
-                for (offset, res) in chunk_res.into_iter().enumerate() {
-                    guard[start + offset] = Some(res);
+            let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut chunk_res = Vec::with_capacity(end - start);
+                for i in start..end {
+                    let output = run_crypto_pipeline(&payloads_ref[i], rounds);
+                    chunk_res.push(output);
+                }
+                chunk_res
+            }));
+
+            let count = end - start;
+            match panic_res {
+                Ok(chunk_res) => {
+                    let mut guard = inner_clone.results.lock();
+                    for (offset, res) in chunk_res.into_iter().enumerate() {
+                        guard[start + offset] = Some(res);
+                    }
+                }
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "batch chunk panicked".to_string()
+                    };
+                    *inner_clone.panic_error.lock() = Some(msg);
                 }
             }
+
             if inner_clone.remaining.fetch_sub(count, std::sync::atomic::Ordering::AcqRel) == count {
-                let cb_opt = inner_clone.callback.lock().take();
-                if let Some(cb) = cb_opt {
+                let callbacks = {
+                    let mut cb_guard = inner_clone.callbacks.lock();
+                    std::mem::take(&mut *cb_guard)
+                };
+                if !callbacks.is_empty() {
                     Python::with_gil(|py| {
-                        let _ = cb.call1(py, ());
+                        for cb in callbacks {
+                            let _ = cb.call1(py, ());
+                        }
                     });
                 }
             }
@@ -402,11 +506,12 @@ fn batch_spawn_native_pipeline(payloads: Vec<Vec<u8>>, rounds: usize) -> PyBatch
 struct CallableTaskInner {
     result: parking_lot::Mutex<Option<PyResult<Py<PyAny>>>>,
     done: AtomicBool,
-    callback: parking_lot::Mutex<Option<Py<PyAny>>>,
+    callbacks: parking_lot::Mutex<Vec<Py<PyAny>>>,
 }
 
 /// An awaitable generic Python callable task executed on Hypertile's work-stealing pool.
 #[pyclass(name = "CallableTask")]
+#[derive(Clone)]
 pub struct PyCallableTask {
     inner: Arc<CallableTaskInner>,
 }
@@ -427,35 +532,34 @@ impl PyCallableTask {
     }
 
     pub fn add_done_callback(&self, py: Python<'_>, cb: Py<PyAny>) -> PyResult<()> {
-        let mut cb_guard = self.inner.callback.lock();
+        let mut cb_guard = self.inner.callbacks.lock();
         if self.inner.done.load(std::sync::atomic::Ordering::Acquire) {
             drop(cb_guard);
             let _ = cb.call1(py, ());
         } else {
-            *cb_guard = Some(cb);
+            cb_guard.push(cb);
         }
         Ok(())
     }
 
-    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    fn __await__(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        bridge_task_await(&slf)
+    }
+
+    fn __iter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
         slf
     }
 
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(slf: PyRef<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
-        if slf.inner.done.load(std::sync::atomic::Ordering::Acquire) {
-            let py = slf.py();
-            let res_guard = slf.inner.result.lock();
-            match res_guard.as_ref() {
-                Some(Ok(v)) => Err(pyo3::exceptions::PyStopIteration::new_err(v.clone_ref(py))),
-                Some(Err(e)) => Err(e.clone_ref(py)),
-                None => Err(pyo3::exceptions::PyStopIteration::new_err(py.None())),
+    fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        if slf.borrow().done() {
+            let res = slf.borrow().result(py);
+            match res {
+                Ok(val) => Err(pyo3::exceptions::PyStopIteration::new_err(val)),
+                Err(err) => Err(err),
             }
         } else {
-            Ok(Some(slf.py().None()))
+            Ok(Some(py.None()))
         }
     }
 }
@@ -472,7 +576,7 @@ fn spawn_callable(
     let inner = Arc::new(CallableTaskInner {
         result: parking_lot::Mutex::new(None),
         done: AtomicBool::new(false),
-        callback: parking_lot::Mutex::new(None),
+        callbacks: parking_lot::Mutex::new(Vec::new()),
     });
 
     let inner_clone = inner.clone();
@@ -480,23 +584,38 @@ fn spawn_callable(
     let rt = global_runtime();
     rt.spawn(async move {
         Python::with_gil(|py| {
-            let call_res = match (args.as_ref(), kwargs.as_ref()) {
-                (Some(a), Some(kw)) => func.bind(py).call(a.bind(py), Some(kw.bind(py))),
-                (Some(a), None) => func.bind(py).call1(a.bind(py)),
-                (None, Some(kw)) => func.bind(py).call((), Some(kw.bind(py))),
-                (None, None) => func.bind(py).call0(),
-            };
+            let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match (args.as_ref(), kwargs.as_ref()) {
+                    (Some(a), Some(kw)) => func.bind(py).call(a.bind(py), Some(kw.bind(py))),
+                    (Some(a), None) => func.bind(py).call1(a.bind(py)),
+                    (None, Some(kw)) => func.bind(py).call((), Some(kw.bind(py))),
+                    (None, None) => func.bind(py).call0(),
+                }
+            }));
 
-            let stored_res = match call_res {
-                Ok(val) => Ok(val.unbind()),
-                Err(err) => Err(err),
+            let stored_res = match panic_res {
+                Ok(Ok(val)) => Ok(val.unbind()),
+                Ok(Err(err)) => Err(err),
+                Err(panic_payload) => {
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "callable task panicked".to_string()
+                    };
+                    Err(PanicInTask::new_err(msg))
+                }
             };
 
             *inner_clone.result.lock() = Some(stored_res);
             inner_clone.done.store(true, std::sync::atomic::Ordering::Release);
 
-            let cb_opt = inner_clone.callback.lock().take();
-            if let Some(cb) = cb_opt {
+            let callbacks = {
+                let mut cb_guard = inner_clone.callbacks.lock();
+                std::mem::take(&mut *cb_guard)
+            };
+            for cb in callbacks {
                 let _ = cb.call1(py, ());
             }
         });
@@ -508,11 +627,12 @@ fn spawn_callable(
 struct BatchCallableInner {
     results: parking_lot::Mutex<Vec<Option<PyResult<Py<PyAny>>>>>,
     remaining: std::sync::atomic::AtomicUsize,
-    callback: parking_lot::Mutex<Option<Py<PyAny>>>,
+    callbacks: parking_lot::Mutex<Vec<Py<PyAny>>>,
 }
 
 /// An awaitable batch of Python callables executed in parallel across Hypertile workers.
 #[pyclass(name = "BatchCallableTask")]
+#[derive(Clone)]
 pub struct PyBatchCallableTask {
     inner: Arc<BatchCallableInner>,
 }
@@ -540,31 +660,34 @@ impl PyBatchCallableTask {
     }
 
     pub fn add_done_callback(&self, py: Python<'_>, cb: Py<PyAny>) -> PyResult<()> {
-        let mut cb_guard = self.inner.callback.lock();
+        let mut cb_guard = self.inner.callbacks.lock();
         if self.done() {
             drop(cb_guard);
             let _ = cb.call1(py, ());
         } else {
-            *cb_guard = Some(cb);
+            cb_guard.push(cb);
         }
         Ok(())
     }
 
-    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    fn __await__(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        bridge_task_await(&slf)
+    }
+
+    fn __iter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
         slf
     }
 
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(slf: PyRef<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
-        if slf.done() {
-            let py = slf.py();
-            let res = slf.result(py)?;
-            Err(pyo3::exceptions::PyStopIteration::new_err(res))
+    fn __next__(slf: Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        if slf.borrow().done() {
+            let res = slf.borrow().result(py);
+            match res {
+                Ok(val) => Err(pyo3::exceptions::PyStopIteration::new_err(val)),
+                Err(err) => Err(err),
+            }
         } else {
-            Ok(Some(slf.py().None()))
+            Ok(Some(py.None()))
         }
     }
 }
@@ -584,7 +707,7 @@ fn batch_spawn_callable(
     let inner = Arc::new(BatchCallableInner {
         results: parking_lot::Mutex::new(initial_results),
         remaining: std::sync::atomic::AtomicUsize::new(total),
-        callback: parking_lot::Mutex::new(None),
+        callbacks: parking_lot::Mutex::new(Vec::new()),
     });
 
     if total == 0 {
@@ -594,7 +717,7 @@ fn batch_spawn_callable(
     let rt = global_runtime();
     let num_workers = rt.core().registry().active_count().max(1);
     let num_chunks = (num_workers * 4).min(total).max(1);
-    let chunk_size = (total + num_chunks - 1) / num_chunks;
+    let chunk_size = total.div_ceil(num_chunks);
 
     let args_arc = Arc::new(args_list);
 
@@ -628,8 +751,11 @@ fn batch_spawn_callable(
                     }
                 }
                 if inner_clone.remaining.fetch_sub(count, std::sync::atomic::Ordering::AcqRel) == count {
-                    let cb_opt = inner_clone.callback.lock().take();
-                    if let Some(cb) = cb_opt {
+                    let callbacks = {
+                        let mut cb_guard = inner_clone.callbacks.lock();
+                        std::mem::take(&mut *cb_guard)
+                    };
+                    for cb in callbacks {
                         let _ = cb.call1(py, ());
                     }
                 }

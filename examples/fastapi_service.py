@@ -25,8 +25,11 @@ try:
     from fastapi import FastAPI
     from pydantic import BaseModel
 except ImportError:
-    print("FastAPI is not installed in the current environment. Run: uv pip install fastapi")
+    print(
+        "FastAPI is not installed in the current environment. Run: uv pip install fastapi"
+    )
     import sys
+
     sys.exit(0)
 
 import hypertile
@@ -34,6 +37,7 @@ import hypertile
 # ---------------------------------------------------------------------------
 # Hypertile Decorated Tasks
 # ---------------------------------------------------------------------------
+
 
 @hypertile.task
 def cpu_heavy_hash(data: str, iterations: int = 10_000) -> str:
@@ -52,10 +56,13 @@ def cpu_heavy_hash(data: str, iterations: int = 10_000) -> str:
 # Lifespan: Worker Registration & Deregistration
 # ---------------------------------------------------------------------------
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager that joins the Hypertile executor pool."""
-    print("[Hypertile FastAPI] Starting up: Registering worker into work-stealing pool...")
+    print(
+        "[Hypertile FastAPI] Starting up: Registering worker into work-stealing pool..."
+    )
     worker = None
     try:
         worker = hypertile.register_worker(kind="bilingual")
@@ -82,6 +89,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 # Request Models & Endpoints
 # ---------------------------------------------------------------------------
+
 
 class HashRequest(BaseModel):
     data: str
@@ -149,19 +157,30 @@ if __name__ == "__main__":
     with TestClient(app) as client:
         # Test 1: Health check
         res_health = client.get("/health")
-        print(f"GET  /health                  -> {res_health.status_code} | {res_health.json()}")
+        print(
+            f"GET  /health                  -> {res_health.status_code} | {res_health.json()}"
+        )
 
         # Test 2: Hypertile Task Offloading
         t0 = time.perf_counter()
-        res_hash = client.post("/compute/hash", json={"data": "hypertile-payload", "iterations": 5_000})
+        res_hash = client.post(
+            "/compute/hash", json={"data": "hypertile-payload", "iterations": 5_000}
+        )
         t_hash = (time.perf_counter() - t0) * 1000
-        print(f"POST /compute/hash            -> {res_hash.status_code} | {res_hash.json()['digest'][:16]}... ({t_hash:.2f}ms)")
+        print(
+            f"POST /compute/hash            -> {res_hash.status_code} | {res_hash.json()['digest'][:16]}... ({t_hash:.2f}ms)"
+        )
 
         # Test 3: Native Pipeline
         t0 = time.perf_counter()
-        res_pipe = client.post("/compute/native-pipeline", json={"payload": "secret-key-material", "rounds": 100})
+        res_pipe = client.post(
+            "/compute/native-pipeline",
+            json={"payload": "secret-key-material", "rounds": 100},
+        )
         t_pipe = (time.perf_counter() - t0) * 1000
-        print(f"POST /compute/native-pipeline -> {res_pipe.status_code} | {res_pipe.json()['result_hex'][:16]}... ({t_pipe:.2f}ms)")
+        print(
+            f"POST /compute/native-pipeline -> {res_pipe.status_code} | {res_pipe.json()['result_hex'][:16]}... ({t_pipe:.2f}ms)"
+        )
 
     print("=" * 70)
     print("All FastAPI endpoints verified successfully with Hypertile!")

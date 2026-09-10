@@ -107,17 +107,21 @@ impl WorkerHandle {
             Steal::Empty => {}
         }
 
-        // 3. Peer stealing with fast randomized victim selection
+        // 3. Peer stealing with fast randomized victim selection (excluding self)
         let stealers = self.core.registry().get_stealers();
-        if !stealers.is_empty() {
+        if stealers.len() > 1 {
             let n = stealers.len();
             let start = fast_rand(self.id) % n;
             for i in 0..n {
                 let idx = (start + i) % n;
-                match steal_into_local(&stealers[idx]) {
+                let (peer_id, ref stealer) = stealers[idx];
+                if peer_id == self.id {
+                    continue;
+                }
+                match steal_into_local(stealer) {
                     Steal::Success(task) => return Some(task),
                     Steal::Retry => {
-                        if let Steal::Success(task) = steal_into_local(&stealers[idx]) {
+                        if let Steal::Success(task) = steal_into_local(stealer) {
                             return Some(task);
                         }
                     }
@@ -202,8 +206,8 @@ impl WorkerHandle {
                 continue;
             }
 
-            // Park with a short sub-millisecond timeout for immediate responsiveness
-            self.parker.park_timeout(Duration::from_micros(500));
+            // Park with responsive 5ms timeout to eliminate idle thread spinning
+            self.parker.park_timeout(Duration::from_millis(5));
             self.core.registry().unmark_idle(self.id);
         }
     }

@@ -20,16 +20,19 @@ import hypertile
 
 
 def generate_payload(idx: int) -> bytes:
-    return json.dumps({
-        "req_id": f"tx-{idx:07d}",
-        "tenant": f"cluster-{idx % 32}",
-        "body": "stream-packet-buffer-payload-telemetry" * 6,
-    }).encode("utf-8")
+    return json.dumps(
+        {
+            "req_id": f"tx-{idx:07d}",
+            "tenant": f"cluster-{idx % 32}",
+            "body": "stream-packet-buffer-payload-telemetry" * 6,
+        }
+    ).encode("utf-8")
 
 
 # ============================================================================
 # Mode A: Standard ThreadPoolExecutor (Double-Hop Offload)
 # ============================================================================
+
 
 async def run_standard_suite(total: int, concurrency: int) -> dict[str, float]:
     pool = ThreadPoolExecutor(max_workers=8)
@@ -42,7 +45,9 @@ async def run_standard_suite(total: int, concurrency: int) -> dict[str, float]:
             await asyncio.sleep(0.0001)  # Async ingest
             loop = asyncio.get_running_loop()
             # Standard threadpool offload (double-hop)
-            await loop.run_in_executor(pool, hypertile.native_pipeline_transform, data, 100)
+            await loop.run_in_executor(
+                pool, hypertile.native_pipeline_transform, data, 100
+            )
             await asyncio.sleep(0.0001)  # Async egress
             latencies.append((time.perf_counter() - t0) * 1000.0)
 
@@ -67,6 +72,7 @@ async def run_standard_suite(total: int, concurrency: int) -> dict[str, float]:
 # ============================================================================
 # Mode B: Hypertile Direct Native Task (Single-Hop Continuation)
 # ============================================================================
+
 
 async def run_hypertile_direct_suite(total: int, concurrency: int) -> dict[str, float]:
     sem = asyncio.Semaphore(concurrency)
@@ -102,9 +108,12 @@ async def run_hypertile_direct_suite(total: int, concurrency: int) -> dict[str, 
 # Mode C: Hypertile Vectorized Batch Pipeline (Zero-Overhead Vector FFI)
 # ============================================================================
 
-async def run_vectorized_batch_suite(total: int, batch_size: int = 100) -> dict[str, float]:
+
+async def run_vectorized_batch_suite(
+    total: int, batch_size: int = 100
+) -> dict[str, float]:
     payloads = [generate_payload(i) for i in range(total)]
-    chunks = [payloads[i:i + batch_size] for i in range(0, total, batch_size)]
+    chunks = [payloads[i : i + batch_size] for i in range(0, total, batch_size)]
 
     t_start = time.perf_counter()
     tasks = [hypertile.batch_native_pipeline(chunk, rounds=100) for chunk in chunks]
@@ -128,27 +137,41 @@ async def run_vectorized_batch_suite(total: int, batch_size: int = 100) -> dict[
 def main():
     print("=" * 80)
     print("      HYPERTILE FREE-THREADED (NO-GIL) SHOWCASE BENCHMARK REPORT")
-    print(f"Platform: {sys.platform} | Python: {sys.version.split()[0]} | Free-threaded: {hypertile.is_free_threaded()}")
+    print(
+        f"Platform: {sys.platform} | Python: {sys.version.split()[0]} | Free-threaded: {hypertile.is_free_threaded()}"
+    )
     print("=" * 80)
 
     total_requests = 10_000
     concurrency = 256
 
-    print(f"\n[1/3] Running Mode A: Standard ThreadPoolExecutor ({total_requests:,} requests @ {concurrency} concurrency)...")
+    print(
+        f"\n[1/3] Running Mode A: Standard ThreadPoolExecutor ({total_requests:,} requests @ {concurrency} concurrency)..."
+    )
     std_res = asyncio.run(run_standard_suite(total_requests, concurrency))
-    print(f"      Completed in {std_res['wall_s']:.2f}s ({std_res['req_s']:,.0f} req/s, p50: {std_res['p50_ms']:.2f}ms, p99: {std_res['p99_ms']:.2f}ms)")
+    print(
+        f"      Completed in {std_res['wall_s']:.2f}s ({std_res['req_s']:,.0f} req/s, p50: {std_res['p50_ms']:.2f}ms, p99: {std_res['p99_ms']:.2f}ms)"
+    )
 
     time.sleep(0.3)
 
-    print(f"\n[2/3] Running Mode B: Hypertile Direct Native Task ({total_requests:,} requests @ {concurrency} concurrency)...")
+    print(
+        f"\n[2/3] Running Mode B: Hypertile Direct Native Task ({total_requests:,} requests @ {concurrency} concurrency)..."
+    )
     hyp_res = asyncio.run(run_hypertile_direct_suite(total_requests, concurrency))
-    print(f"      Completed in {hyp_res['wall_s']:.2f}s ({hyp_res['req_s']:,.0f} req/s, p50: {hyp_res['p50_ms']:.2f}ms, p99: {hyp_res['p99_ms']:.2f}ms)")
+    print(
+        f"      Completed in {hyp_res['wall_s']:.2f}s ({hyp_res['req_s']:,.0f} req/s, p50: {hyp_res['p50_ms']:.2f}ms, p99: {hyp_res['p99_ms']:.2f}ms)"
+    )
 
     time.sleep(0.3)
 
-    print(f"\n[3/3] Running Mode C: Hypertile Vectorized Batch ({total_requests:,} requests in chunks of 100)...")
+    print(
+        f"\n[3/3] Running Mode C: Hypertile Vectorized Batch ({total_requests:,} requests in chunks of 100)..."
+    )
     batch_res = asyncio.run(run_vectorized_batch_suite(total_requests, batch_size=100))
-    print(f"      Completed in {batch_res['wall_s']:.4f}s ({batch_res['req_s']:,.0f} req/s, amortized: {batch_res['p50_ms']*1000:.2f} us/item)")
+    print(
+        f"      Completed in {batch_res['wall_s']:.4f}s ({batch_res['req_s']:,.0f} req/s, amortized: {batch_res['p50_ms'] * 1000:.2f} us/item)"
+    )
 
     speedup_b = hyp_res["req_s"] / std_res["req_s"]
     speedup_c = batch_res["req_s"] / std_res["req_s"]
@@ -156,17 +179,33 @@ def main():
     print("\n" + "=" * 92)
     print("                              FREE-THREADED COMPARISON TABLE")
     print("=" * 92)
-    print(f"{'Metric':<24} | {'ThreadPool (Mode A)':<20} | {'Hypertile Direct (B)':<21} | {'Hypertile Vector (C)':<20}")
+    print(
+        f"{'Metric':<24} | {'ThreadPool (Mode A)':<20} | {'Hypertile Direct (B)':<21} | {'Hypertile Vector (C)':<20}"
+    )
     print("-" * 92)
-    print(f"{'Throughput (req/s)':<24} | {std_res['req_s']:>18,.0f} | {hyp_res['req_s']:>19,.0f} | {batch_res['req_s']:>18,.0f}")
-    print(f"{'Wall Time (s)':<24} | {std_res['wall_s']:>18.3f} | {hyp_res['wall_s']:>19.3f} | {batch_res['wall_s']:>18.4f}")
-    print(f"{'Median Latency (p50)':<24} | {std_res['p50_ms']:>15.2f} ms | {hyp_res['p50_ms']:>16.2f} ms | {batch_res['p50_ms']*1000:>15.2f} us")
-    print(f"{'95th Percentile (p95)':<24} | {std_res['p95_ms']:>15.2f} ms | {hyp_res['p95_ms']:>16.2f} ms | {batch_res['p95_ms']*1000:>15.2f} us")
-    print(f"{'Tail Latency (p99)':<24} | {std_res['p99_ms']:>15.2f} ms | {hyp_res['p99_ms']:>16.2f} ms | {batch_res['p99_ms']*1000:>15.2f} us")
+    print(
+        f"{'Throughput (req/s)':<24} | {std_res['req_s']:>18,.0f} | {hyp_res['req_s']:>19,.0f} | {batch_res['req_s']:>18,.0f}"
+    )
+    print(
+        f"{'Wall Time (s)':<24} | {std_res['wall_s']:>18.3f} | {hyp_res['wall_s']:>19.3f} | {batch_res['wall_s']:>18.4f}"
+    )
+    print(
+        f"{'Median Latency (p50)':<24} | {std_res['p50_ms']:>15.2f} ms | {hyp_res['p50_ms']:>16.2f} ms | {batch_res['p50_ms'] * 1000:>15.2f} us"
+    )
+    print(
+        f"{'95th Percentile (p95)':<24} | {std_res['p95_ms']:>15.2f} ms | {hyp_res['p95_ms']:>16.2f} ms | {batch_res['p95_ms'] * 1000:>15.2f} us"
+    )
+    print(
+        f"{'Tail Latency (p99)':<24} | {std_res['p99_ms']:>15.2f} ms | {hyp_res['p99_ms']:>16.2f} ms | {batch_res['p99_ms'] * 1000:>15.2f} us"
+    )
     print("=" * 92)
     print("SUMMARY:")
-    print(f"  - Mode B (Direct Native): {speedup_b:.2f}x throughput increase, {std_res['p50_ms']/hyp_res['p50_ms']:.1f}x lower median latency.")
-    print(f"  - Mode C (Vector Batch):  {speedup_c:.1f}x throughput increase over standard ThreadPoolExecutor!")
+    print(
+        f"  - Mode B (Direct Native): {speedup_b:.2f}x throughput increase, {std_res['p50_ms'] / hyp_res['p50_ms']:.1f}x lower median latency."
+    )
+    print(
+        f"  - Mode C (Vector Batch):  {speedup_c:.1f}x throughput increase over standard ThreadPoolExecutor!"
+    )
     print("=" * 92 + "\n")
 
 
