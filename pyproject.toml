@@ -9,6 +9,7 @@ description = "A shared, work-stealing executor for free-threaded Python corouti
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT OR Apache-2.0" }
+license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 authors = [{ name = "Hypertile Contributors" }]
 classifiers = [
     "Programming Language :: Rust",
@@ -29,6 +30,7 @@ manifest-path = "hypertile-sys/Cargo.toml"
 module-name = "hypertile._hypertile_sys"
 python-source = "python"
 include = ["python/hypertile/py.typed", "python/hypertile/__init__.pyi", "python/hypertile/_hypertile_sys.pyi"]
+sdist-include = ["LICENSE-APACHE", "LICENSE-MIT"]
 
 [tool.pyright]
 include = ["python", "tests", "examples", "benches", "showcase"]
