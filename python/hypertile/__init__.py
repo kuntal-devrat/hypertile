@@ -156,12 +156,15 @@ def to_thread(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Any:
     Example:
         result = await hypertile.to_thread(crypto_hash, payload, rounds=50)
     """
+    import asyncio
+    if asyncio.iscoroutinefunction(func):
+        raise TypeError("hypertile.to_thread() does not accept coroutines; use await func() directly.")
+
     try:
         args_tuple = tuple(args) if args else None
         kwargs_dict = dict(kwargs) if kwargs else None
         return _spawn_callable(func, args_tuple, kwargs_dict)
     except (NotImplementedError, NameError):
-        import asyncio
         return asyncio.to_thread(func, *args, **kwargs)
 
 

@@ -49,7 +49,7 @@ impl Runnable for PyCoroutineTask {
 
     fn run(self: Arc<Self>) {
         Python::with_gil(|py| {
-            let coro_guard = self.coro.lock();
+            let mut coro_guard = self.coro.lock();
             let coro = match coro_guard.as_ref() {
                 Some(c) => c.bind(py),
                 None => return,
@@ -59,6 +59,7 @@ impl Runnable for PyCoroutineTask {
             if self.token.load(Ordering::Acquire) {
                 let cancel_exc = TaskCancelled::new_err("coroutine cancelled cooperatively");
                 let _ = coro.call_method1("throw", (cancel_exc,));
+                *coro_guard = None; // Drop coroutine reference to free memory immediately
                 if let Some(cb) = self.done_callback.lock().take() {
                     let _ = cb.call1(py, (py.None(), TaskCancelled::new_err("cancelled")));
                 }
@@ -75,6 +76,7 @@ impl Runnable for PyCoroutineTask {
                     let task_clone = self.clone();
                     let sched = self.scheduler.clone();
 
+                    let mut hooked = false;
                     // If yielded has add_done_callback, hook into it
                     if yielded.hasattr("add_done_callback").unwrap_or(false) {
                         let wake_fn = pyo3::types::PyCFunction::new_closure(
@@ -87,9 +89,12 @@ impl Runnable for PyCoroutineTask {
                             },
                         );
                         if let Ok(wake_py) = wake_fn {
-                            let _ = yielded.call_method1("add_done_callback", (wake_py,));
+                            if yielded.call_method1("add_done_callback", (wake_py,)).is_ok() {
+                                hooked = true;
+                            }
                         }
-                    } else {
+                    }
+                    if !hooked {
                         // Reschedule directly
                         self.scheduler.inject(TaskHandle::new(self.clone()));
                     }
@@ -104,11 +109,15 @@ impl Runnable for PyCoroutineTask {
                             .map(|v| v.unbind())
                             .unwrap_or_else(|_| py.None());
 
+                        *coro_guard = None; // Drop coroutine reference to free memory immediately
+
                         if let Some(cb) = self.done_callback.lock().take() {
                             let _ = cb.call1(py, (value, py.None()));
                         }
                     } else {
                         // Unhandled exception in coroutine
+                        *coro_guard = None; // Drop coroutine reference to free memory immediately
+
                         if let Some(cb) = self.done_callback.lock().take() {
                             let _ = cb.call1(py, (py.None(), err));
                         }

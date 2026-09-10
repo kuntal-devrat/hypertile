@@ -122,9 +122,16 @@ impl<T: Send + 'static> TaskCell<T> {
                 return false; // Already queued
             }
             if curr == STATE_RUNNING {
-                // Running task woke itself; we transition back to scheduled so it re-queues
+                // Running task woke itself; atomically transition to SCHEDULED so it re-queues
                 // after polling completes.
-                return false;
+                if self
+                    .state
+                    .compare_exchange_weak(curr, STATE_SCHEDULED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return false;
+                }
+                continue;
             }
             if self
                 .state
@@ -177,14 +184,28 @@ impl<T: Send + 'static> Runnable for TaskCell<T> {
                     }
                 }
                 Ok(Poll::Pending) => {
-                    // Put future back
-                    *future_slot = Some(fut);
-
-                    // Check if a wake() arrived while we were polling
-                    let prev = self.state.swap(STATE_IDLE, Ordering::AcqRel);
-                    if prev == STATE_SCHEDULED {
-                        // Re-schedule immediately
-                        self.scheduler.schedule(TaskHandle::new(self.clone()));
+                    // Check if task was cancelled while polling, or woke itself
+                    loop {
+                        let curr = self.state.load(Ordering::Acquire);
+                        if curr == STATE_COMPLETED {
+                            // Task was cancelled during poll: drop future and do not reschedule
+                            drop(fut);
+                            break;
+                        }
+                        if self
+                            .state
+                            .compare_exchange_weak(curr, STATE_IDLE, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            *future_slot = Some(fut);
+                            if curr == STATE_SCHEDULED {
+                                let handle = TaskHandle::new(self.clone());
+                                if !crate::waker::try_single_hop_push(handle.clone()) {
+                                    self.scheduler.schedule(handle);
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 Err(panic_payload) => {

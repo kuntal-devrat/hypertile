@@ -70,8 +70,18 @@ impl Runtime {
     /// Shut down the runtime and join all worker threads.
     pub fn shutdown(&self) {
         self.core.shutdown();
-        let mut threads = self.worker_threads.lock();
-        for handle in threads.drain(..) {
+        let current_id = std::thread::current().id();
+        let mut to_join = Vec::new();
+        {
+            let mut threads = self.worker_threads.lock();
+            for handle in threads.drain(..) {
+                if handle.thread().id() == current_id {
+                    continue;
+                }
+                to_join.push(handle);
+            }
+        }
+        for handle in to_join {
             let _ = handle.join();
         }
     }

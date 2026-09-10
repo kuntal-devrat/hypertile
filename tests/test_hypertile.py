@@ -205,3 +205,35 @@ def test_gather_to_thread_exception():
 
     asyncio.run(main())
 
+
+def test_callable_task_repeated_await_and_result():
+    async def main():
+        t = hypertile.to_thread(lambda: 99)
+        res1 = await t
+        assert res1 == 99
+        res2 = await t
+        assert res2 == 99
+        res3 = t.result()
+        assert res3 == 99
+
+    asyncio.run(main())
+
+
+def test_to_thread_rejects_coroutine():
+    async def fake_coro():
+        return 1
+
+    with pytest.raises(TypeError, match="does not accept coroutines"):
+        hypertile.to_thread(fake_coro)
+
+
+def test_batch_empty_inputs():
+    async def main():
+        empty_native = await hypertile.batch_native_pipeline([])
+        assert empty_native == []
+
+        empty_callable = await hypertile.gather_to_thread(lambda x: x, [])
+        assert empty_callable == []
+
+    asyncio.run(main())
+

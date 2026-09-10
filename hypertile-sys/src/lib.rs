@@ -448,11 +448,11 @@ impl PyCallableTask {
     fn __next__(slf: PyRef<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
         if slf.inner.done.load(std::sync::atomic::Ordering::Acquire) {
             let py = slf.py();
-            let mut res_guard = slf.inner.result.lock();
-            match res_guard.take() {
-                Some(Ok(v)) => Err(pyo3::exceptions::PyStopIteration::new_err(v)),
-                Some(Err(e)) => Err(e),
-                None => Ok(Some(py.None())),
+            let res_guard = slf.inner.result.lock();
+            match res_guard.as_ref() {
+                Some(Ok(v)) => Err(pyo3::exceptions::PyStopIteration::new_err(v.clone_ref(py))),
+                Some(Err(e)) => Err(e.clone_ref(py)),
+                None => Err(pyo3::exceptions::PyStopIteration::new_err(py.None())),
             }
         } else {
             Ok(Some(slf.py().None()))

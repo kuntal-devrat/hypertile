@@ -162,12 +162,17 @@ impl Future for Sleep {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if Instant::now() >= self.deadline {
+        let now = Instant::now();
+        // Allow a 50-microsecond threshold for cross-core clock skew / timer granularity
+        if now >= self.deadline || self.deadline.saturating_duration_since(now) <= Duration::from_micros(50) {
             Poll::Ready(())
         } else {
             if !self.registered {
                 get_timer_driver().register(self.deadline, cx.waker().clone());
                 self.registered = true;
+            } else {
+                // If woken early before deadline, re-register to guarantee we don't hang
+                get_timer_driver().register(self.deadline, cx.waker().clone());
             }
             Poll::Pending
         }
