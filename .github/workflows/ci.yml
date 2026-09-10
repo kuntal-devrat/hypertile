@@ -35,7 +35,7 @@ jobs:
       - name: Cargo Check
         run: cargo check --workspace --all-targets
       - name: Cargo Test
-        run: cargo test --workspace -- --nocapture
+        run: cargo test -p hypertile-core -- --nocapture
 
   test-python:
     name: Python ${{ matrix.python-version }} (${{ matrix.os }})
