@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use crossbeam_deque::{Injector, Steal, Stealer};
 use crossbeam_utils::sync::Unparker;
+use crossbeam_utils::CachePadded;
 use parking_lot::RwLock;
 
 use crate::task::{JoinHandle, RawTask, TaskHandle, TaskScheduler};
@@ -37,11 +38,12 @@ pub struct WorkerEntry {
 }
 
 /// Registry of all active workers and idle tracking.
+/// Uses CachePadded on hot atomics and locks to eliminate cross-core cache-line bouncing.
 pub struct WorkerRegistry {
     workers: RwLock<HashMap<WorkerId, WorkerEntry>>,
-    idle_stack: RwLock<Vec<WorkerId>>,
-    idle_count: AtomicUsize,
-    stealers_cache: RwLock<Arc<Vec<Stealer<TaskHandle>>>>,
+    idle_stack: CachePadded<RwLock<Vec<WorkerId>>>,
+    idle_count: CachePadded<AtomicUsize>,
+    stealers_cache: CachePadded<RwLock<Arc<Vec<Stealer<TaskHandle>>>>>,
     next_id: AtomicUsize,
 }
 
@@ -49,9 +51,9 @@ impl WorkerRegistry {
     pub fn new() -> Self {
         Self {
             workers: RwLock::new(HashMap::new()),
-            idle_stack: RwLock::new(Vec::new()),
-            idle_count: AtomicUsize::new(0),
-            stealers_cache: RwLock::new(Arc::new(Vec::new())),
+            idle_stack: CachePadded::new(RwLock::new(Vec::new())),
+            idle_count: CachePadded::new(AtomicUsize::new(0)),
+            stealers_cache: CachePadded::new(RwLock::new(Arc::new(Vec::new()))),
             next_id: AtomicUsize::new(0),
         }
     }
@@ -184,11 +186,11 @@ impl ExecutorCore {
     }
 
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.running.load(Ordering::Relaxed)
     }
 
     pub fn set_running(&self, v: bool) {
-        self.running.store(v, Ordering::SeqCst);
+        self.running.store(v, Ordering::Release);
         if !v {
             self.registry.unpark_all();
         }

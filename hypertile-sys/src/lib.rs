@@ -164,18 +164,16 @@ pub fn run_crypto_pipeline(data: &[u8], rounds: usize) -> Vec<u8> {
         state ^= *b as u64;
         state = state.wrapping_mul(0x100000001b3);
     }
-    let mut output = Vec::with_capacity(32);
+    let mut out = [0u8; 32];
     for r in 0..rounds {
         state = state.rotate_left(13) ^ (r as u64).wrapping_mul(0x517cc1b727220a95);
         state = state.wrapping_add(0x9e3779b97f4a7c15);
         if r % 4 == 0 {
-            output.extend_from_slice(&state.to_le_bytes());
-            if output.len() >= 32 {
-                output.truncate(32);
-            }
+            let slot = (r / 4) % 4;
+            out[slot * 8..(slot + 1) * 8].copy_from_slice(&state.to_le_bytes());
         }
     }
-    output
+    out.to_vec()
 }
 
 /// CPU-intensive native Rust computation step (cryptographic mixing & hashing).
@@ -358,15 +356,36 @@ fn batch_spawn_native_pipeline(payloads: Vec<Vec<u8>>, rounds: usize) -> PyBatch
     }
 
     let rt = global_runtime();
-    for (i, payload) in payloads.into_iter().enumerate() {
+    let num_workers = rt.core().registry().active_count().max(1);
+    let num_chunks = (num_workers * 4).min(total).max(1);
+    let chunk_size = (total + num_chunks - 1) / num_chunks;
+
+    let payloads_arc = Arc::new(payloads);
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = (start + chunk_size).min(total);
+        if start >= end {
+            break;
+        }
+
         let inner_clone = inner.clone();
+        let payloads_ref = payloads_arc.clone();
+
         rt.spawn(async move {
-            let output = run_crypto_pipeline(&payload, rounds);
+            let mut chunk_res = Vec::with_capacity(end - start);
+            for i in start..end {
+                let output = run_crypto_pipeline(&payloads_ref[i], rounds);
+                chunk_res.push(output);
+            }
+            let count = chunk_res.len();
             {
                 let mut guard = inner_clone.results.lock();
-                guard[i] = Some(output);
+                for (offset, res) in chunk_res.into_iter().enumerate() {
+                    guard[start + offset] = Some(res);
+                }
             }
-            if inner_clone.remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            if inner_clone.remaining.fetch_sub(count, std::sync::atomic::Ordering::AcqRel) == count {
                 let cb_opt = inner_clone.callback.lock().take();
                 if let Some(cb) = cb_opt {
                     Python::with_gil(|py| {
@@ -573,21 +592,42 @@ fn batch_spawn_callable(
     }
 
     let rt = global_runtime();
-    for (i, args) in args_list.into_iter().enumerate() {
+    let num_workers = rt.core().registry().active_count().max(1);
+    let num_chunks = (num_workers * 4).min(total).max(1);
+    let chunk_size = (total + num_chunks - 1) / num_chunks;
+
+    let args_arc = Arc::new(args_list);
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = (start + chunk_size).min(total);
+        if start >= end {
+            break;
+        }
+
         let inner_clone = inner.clone();
         let func_clone = func.clone_ref(py);
+        let args_ref = args_arc.clone();
+
         rt.spawn(async move {
             Python::with_gil(|py| {
-                let call_res = func_clone.bind(py).call1(args.bind(py));
-                let stored_res = match call_res {
-                    Ok(val) => Ok(val.unbind()),
-                    Err(err) => Err(err),
-                };
+                let mut chunk_res = Vec::with_capacity(end - start);
+                for i in start..end {
+                    let call_res = func_clone.bind(py).call1(args_ref[i].bind(py));
+                    let stored_res = match call_res {
+                        Ok(val) => Ok(val.unbind()),
+                        Err(err) => Err(err),
+                    };
+                    chunk_res.push(stored_res);
+                }
+                let count = chunk_res.len();
                 {
                     let mut guard = inner_clone.results.lock();
-                    guard[i] = Some(stored_res);
+                    for (offset, res) in chunk_res.into_iter().enumerate() {
+                        guard[start + offset] = Some(res);
+                    }
                 }
-                if inner_clone.remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                if inner_clone.remaining.fetch_sub(count, std::sync::atomic::Ordering::AcqRel) == count {
                     let cb_opt = inner_clone.callback.lock().take();
                     if let Some(cb) = cb_opt {
                         let _ = cb.call1(py, ());

@@ -14,7 +14,34 @@ use crossbeam_utils::sync::Parker;
 
 use crate::executor::{ExecutorCore, WorkerEntry, WorkerId, WorkerKind};
 use crate::task::{TaskHandle, TaskKind};
-use crate::waker::{local_pop, set_local_worker, take_local_worker};
+use crate::waker::{local_pop, set_local_worker, steal_injector_into_local, steal_into_local, take_local_worker};
+
+thread_local! {
+    static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Ultra-fast non-cryptographic PRNG (SplitMix64).
+/// Requires 0 locks and executes in 2-3 single-cycle ALU instructions.
+#[inline(always)]
+fn fast_rand(worker_id: usize) -> usize {
+    RNG_STATE.with(|state| {
+        let mut s = state.get();
+        if s == 0 {
+            s = (worker_id as u64)
+                .wrapping_add(0x9e3779b97f4a7c15)
+                .wrapping_mul(0xbf58476d1ce4e5b9);
+            if s == 0 {
+                s = 0x853c49e65d6f8304;
+            }
+        }
+        s = s.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        state.set(s);
+        (z ^ (z >> 31)) as usize
+    })
+}
 
 /// Active execution context for a worker.
 pub struct WorkerHandle {
@@ -61,36 +88,36 @@ impl WorkerHandle {
 
     /// Try to find a task to run according to the scheduling hierarchy:
     /// 1. Local deque (immediate continuation)
-    /// 2. Global injector
-    /// 3. Peer stealers
+    /// 2. Global injector (batch-steals half to local deque)
+    /// 3. Peer stealers (batch-steals half to local deque)
     pub fn find_task(&self) -> Option<TaskHandle> {
         // 1. Local deque
         if let Some(task) = local_pop() {
             return Some(task);
         }
 
-        // 2. Global injector
-        match self.core.steal_injector() {
+        // 2. Global injector (batch-steal into local queue)
+        match steal_injector_into_local(self.core.injector()) {
             Steal::Success(task) => return Some(task),
             Steal::Retry => {
-                if let Steal::Success(task) = self.core.steal_injector() {
+                if let Steal::Success(task) = steal_injector_into_local(self.core.injector()) {
                     return Some(task);
                 }
             }
             Steal::Empty => {}
         }
 
-        // 3. Peer stealing with randomized victim selection
+        // 3. Peer stealing with fast randomized victim selection
         let stealers = self.core.registry().get_stealers();
         if !stealers.is_empty() {
             let n = stealers.len();
-            let start = rand::random::<usize>() % n;
+            let start = fast_rand(self.id) % n;
             for i in 0..n {
                 let idx = (start + i) % n;
-                match stealers[idx].steal() {
+                match steal_into_local(&stealers[idx]) {
                     Steal::Success(task) => return Some(task),
                     Steal::Retry => {
-                        if let Steal::Success(task) = stealers[idx].steal() {
+                        if let Steal::Success(task) = steal_into_local(&stealers[idx]) {
                             return Some(task);
                         }
                     }
@@ -155,7 +182,7 @@ impl WorkerHandle {
                     spun_task = Some(task);
                     break;
                 }
-                if let Steal::Success(task) = self.core.steal_injector() {
+                if let Steal::Success(task) = steal_injector_into_local(self.core.injector()) {
                     spun_task = Some(task);
                     break;
                 }
@@ -169,7 +196,7 @@ impl WorkerHandle {
             self.core.registry().mark_idle(self.id);
 
             // Double check injector before sleeping to prevent missed wake race
-            if let Steal::Success(task) = self.core.steal_injector() {
+            if let Steal::Success(task) = steal_injector_into_local(self.core.injector()) {
                 self.core.registry().unmark_idle(self.id);
                 task.run();
                 continue;

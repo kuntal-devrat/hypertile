@@ -181,10 +181,10 @@ Measured on AMD64 Windows:
 
 | Benchmark Mode | Standard ThreadPoolExecutor | Hypertile Direct Native (3.13t) | Hypertile Vectorized Batch | Real-World Impact |
 |---|---|---|---|---|
-| **Throughput (req/s)** | ~10,180 req/s | **17,489 req/s** | **129,810 – 687,112 req/s** | **1.65x (scalar) to 12.7x+ (vector)** |
-| **Median Latency (p50)** | 17.42 ms | **9.35 ms** | **7.70 µs / item** | **-46.3% latency (scalar) / sub-10µs (vector)** |
-| **Tail Latency (p95)** | 39.99 ms | **16.40 ms** | **7.70 µs / item** | **-59.0% tail latency reduction** |
-| **Dynamic Worker Cycle** | N/A (Static Pools) | **3.00 µs / cycle** | N/A | Dynamic external thread adoption |
+| **Throughput (req/s)** | ~10,747 req/s | **19,340 req/s** | **237,270 – 697,817 req/s** | **1.80x (scalar) to 22.1x+ (vector)** |
+| **Median Latency (p50)** | 17.54 ms | **8.21 ms** | **4.21 µs / item** | **-53.2% latency (scalar) / sub-5µs (vector)** |
+| **Tail Latency (p95)** | 24.08 ms | **11.23 ms** | **4.21 µs / item** | **-53.4% tail latency reduction** |
+| **Dynamic Worker Cycle** | N/A (Static Pools) | **2.76 µs / cycle** | N/A | Dynamic external thread adoption |
 | **Rust Boundary Handoff** | N/A | **1.01 µs / hop** | **< 100 ns / item** | Single-hop Chase-Lev deque routing |
 
 

@@ -61,6 +61,32 @@ pub fn is_local_empty() -> bool {
     })
 }
 
+/// Steals a batch of tasks from a remote stealer and moves them into the local worker deque,
+/// popping one task for immediate execution. If on an external thread, steals a single task.
+pub fn steal_into_local(stealer: &crossbeam_deque::Stealer<TaskHandle>) -> crossbeam_deque::Steal<TaskHandle> {
+    LOCAL_WORKER_DEQUE.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(worker) = borrow.as_mut() {
+            stealer.steal_batch_and_pop(worker)
+        } else {
+            stealer.steal()
+        }
+    })
+}
+
+/// Steals a batch of tasks from the global injector and moves them into the local worker deque,
+/// popping one task for immediate execution. If on an external thread, steals a single task.
+pub fn steal_injector_into_local(injector: &crossbeam_deque::Injector<TaskHandle>) -> crossbeam_deque::Steal<TaskHandle> {
+    LOCAL_WORKER_DEQUE.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if let Some(worker) = borrow.as_mut() {
+            injector.steal_batch_and_pop(worker)
+        } else {
+            injector.steal()
+        }
+    })
+}
+
 /// A Waker for a specific [`TaskCell`].
 struct TaskWaker<T: Send + 'static> {
     cell: Arc<TaskCell<T>>,
