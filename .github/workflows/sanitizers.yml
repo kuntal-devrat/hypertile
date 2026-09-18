@@ -28,7 +28,7 @@ jobs:
     name: ThreadSanitizer (race harness)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           # `-Zbuild-std` needs the standard library sources.
@@ -61,7 +61,7 @@ jobs:
     name: AddressSanitizer (core + C ABI)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -96,7 +96,7 @@ jobs:
       matrix:
         mode: [debug, release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
