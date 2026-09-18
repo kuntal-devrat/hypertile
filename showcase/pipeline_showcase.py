@@ -189,12 +189,8 @@ def print_comparison_table(
 ) -> None:
     """Print an aesthetic, high-contrast ASCII comparison table."""
     speedup = hyp_res["throughput_req_s"] / std_res["throughput_req_s"]
-    p50_reduction = (
-        (std_res["p50_ms"] - hyp_res["p50_ms"]) / std_res["p50_ms"]
-    ) * 100.0
-    p99_reduction = (
-        (std_res["p99_ms"] - hyp_res["p99_ms"]) / std_res["p99_ms"]
-    ) * 100.0
+    p50_reduction = ((std_res["p50_ms"] - hyp_res["p50_ms"]) / std_res["p50_ms"]) * 100.0
+    p99_reduction = ((std_res["p99_ms"] - hyp_res["p99_ms"]) / std_res["p99_ms"]) * 100.0
 
     print("\n" + "=" * 80)
     print("        HYPERTILE SHOWCASE BENCHMARK: WITH vs. WITHOUT HYPERTILE")
@@ -203,9 +199,7 @@ def print_comparison_table(
         f"Total Requests: {int(std_res['total_requests']):,} | Workload: Ingest (IO) + Rust Compute + Egress (IO)"
     )
     print("-" * 80)
-    print(
-        f"{'Metric':<25} | {'WITHOUT Hypertile':<20} | {'WITH Hypertile':<20} | {'Delta':<12}"
-    )
+    print(f"{'Metric':<25} | {'WITHOUT Hypertile':<20} | {'WITH Hypertile':<20} | {'Delta':<12}")
     print("-" * 80)
     print(
         f"{'Throughput (req/s)':<25} | {std_res['throughput_req_s']:>17,.0f} | {hyp_res['throughput_req_s']:>17,.0f} | {speedup:>8.2f}x"

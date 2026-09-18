@@ -6,10 +6,19 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.2"
+edition = "2021"
+# Best-effort floor: inline `const {}` initializers in thread-locals require 1.79.
+rust-version = "1.79"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kuntal-devrat/hypertile"
+authors = ["Hypertile Contributors"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# Tasks rely on `catch_unwind` for panic containment, so unwinding must stay enabled.
 panic = "unwind"
 strip = "symbols"
-

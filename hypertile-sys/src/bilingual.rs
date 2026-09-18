@@ -9,14 +9,14 @@
 //! - Single-hop completion handoff to continuations
 //! - Exception propagation (translating StopIteration to success, and errors to failure)
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use parking_lot::Mutex;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use crate::exceptions::{PanicInTask, TaskCancelled};
 use hypertile_core::{ExecutorCore, Runnable, TaskHandle, TaskKind};
-use crate::exceptions::TaskCancelled;
 
 /// A runnable Python coroutine task scheduled within the Hypertile executor.
 pub struct PyCoroutineTask {
@@ -50,7 +50,7 @@ impl Runnable for PyCoroutineTask {
     }
 
     fn run(self: Arc<Self>) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let mut coro_guard = self.coro.lock();
             let coro = match coro_guard.as_ref() {
                 Some(c) => c.bind(py),
@@ -68,12 +68,35 @@ impl Runnable for PyCoroutineTask {
                 return;
             }
 
-            // 2. Step the coroutine via send(val) or throw(exc)
+            // 2. Step the coroutine via send(val) or throw(exc) under catch_unwind
             let next_input = self.pending_value.lock().take();
-            let step_result = match next_input {
-                Some(Ok(val)) => coro.call_method1("send", (val.bind(py),)),
-                Some(Err(err)) => coro.call_method1("throw", (err.bind(py),)),
-                None => coro.call_method1("send", (py.None(),)),
+            let unwind_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match next_input {
+                    Some(Ok(val)) => coro.call_method1("send", (val.bind(py),)),
+                    Some(Err(err)) => coro.call_method1("throw", (err.bind(py),)),
+                    None => coro.call_method1("send", (py.None(),)),
+                }
+            }));
+
+            let step_result = match unwind_res {
+                Ok(res) => res,
+                Err(panic_payload) => {
+                    *coro_guard = None;
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "coroutine panicked during execution".to_string()
+                    };
+                    if let Some(cb) = self.done_callback.lock().take() {
+                        let _ = cb.call1(
+                            py,
+                            (py.None(), PanicInTask::new_err(msg)),
+                        );
+                    }
+                    return;
+                }
             };
 
             match step_result {
@@ -85,22 +108,29 @@ impl Runnable for PyCoroutineTask {
                     let mut hooked = false;
                     // If yielded has add_done_callback, hook into it
                     if yielded.hasattr("add_done_callback").unwrap_or(false) {
+                        let yielded_clone = yielded.clone().unbind();
                         let wake_fn = pyo3::types::PyCFunction::new_closure(
                             py,
                             None,
                             None,
                             move |args, _kwargs| {
-                                Python::with_gil(|_py| {
+                                Python::attach(|py| {
                                     if let Ok(fut) = args.get_item(0) {
                                         if let Ok(exc) = fut.call_method0("exception") {
                                             if !exc.is_none() {
-                                                *task_clone.pending_value.lock() = Some(Err(exc.into_any().unbind()));
+                                                *task_clone.pending_value.lock() =
+                                                    Some(Err(exc.into_any().unbind()));
                                             } else if let Ok(res) = fut.call_method0("result") {
-                                                *task_clone.pending_value.lock() = Some(Ok(res.into_any().unbind()));
+                                                *task_clone.pending_value.lock() =
+                                                    Some(Ok(res.into_any().unbind()));
                                             }
                                         } else if let Ok(res) = fut.call_method0("result") {
-                                            *task_clone.pending_value.lock() = Some(Ok(res.into_any().unbind()));
+                                            *task_clone.pending_value.lock() =
+                                                Some(Ok(res.into_any().unbind()));
                                         }
+                                    } else if let Ok(res) = yielded_clone.bind(py).call_method0("result") {
+                                        *task_clone.pending_value.lock() =
+                                            Some(Ok(res.into_any().unbind()));
                                     }
                                     sched.inject(TaskHandle::new(task_clone.clone()));
                                     Ok::<(), PyErr>(())
@@ -108,15 +138,40 @@ impl Runnable for PyCoroutineTask {
                             },
                         );
                         if let Ok(wake_py) = wake_fn {
-                            if yielded.call_method1("add_done_callback", (wake_py,)).is_ok() {
+                            if yielded
+                                .call_method1("add_done_callback", (wake_py,))
+                                .is_ok()
+                            {
                                 hooked = true;
                             }
                         }
                     }
-                    if !hooked {
-                        // Avoid tight busy-spinning if an unsupported object yielded
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    if !hooked && yielded.is_none() {
+                        // Bare `yield None` (e.g. `await asyncio.sleep(0)`): re-step
+                        // immediately, exactly as an asyncio event loop would.
                         self.scheduler.inject(TaskHandle::new(self.clone()));
+                    } else if !hooked {
+                        // The coroutine is waiting on something this executor cannot
+                        // drive. Fail loudly instead of sleeping forever and hanging the
+                        // caller that is blocked in `run_level1`.
+                        let type_name = yielded
+                            .get_type()
+                            .name()
+                            .map(|name| name.to_string())
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        let msg = format!(
+                            "hypertile Level 1 executor cannot drive an awaitable of type \
+                             '{type_name}': only objects exposing add_done_callback() 
+                             (e.g. asyncio.Future) are supported. Use hypertile.run(coro) or 
+                             hypertile.run(coro, level1=False) for full asyncio support."
+                        );
+                        *coro_guard = None;
+                        if let Some(cb) = self.done_callback.lock().take() {
+                            let _ = cb.call1(
+                                py,
+                                (py.None(), pyo3::exceptions::PyTypeError::new_err(msg)),
+                            );
+                        }
                     }
                 }
                 Err(err) => {

@@ -27,9 +27,7 @@ import hypertile
 
 def run_suite_1_hop_latency(iterations: int = 3_000) -> tuple[float, float]:
     """Measures actual cross-thread offload latency for identical workloads."""
-    print(
-        f"\n[Suite 1] Like-for-Like Boundary Offload Latency ({iterations:,} hops)..."
-    )
+    print(f"\n[Suite 1] Like-for-Like Boundary Offload Latency ({iterations:,} hops)...")
 
     def native_work():
         return 42
@@ -64,9 +62,7 @@ def run_suite_1_hop_latency(iterations: int = 3_000) -> tuple[float, float]:
     if hyp_us < std_us:
         print(f"  --> Hypertile is {std_us / hyp_us:.2f}x faster")
     else:
-        print(
-            f"  --> Hypertile is {hyp_us / std_us:.2f}x slower (wrapper overhead under GIL)"
-        )
+        print(f"  --> Hypertile is {hyp_us / std_us:.2f}x slower (wrapper overhead under GIL)")
 
     return std_us, hyp_us
 
@@ -96,9 +92,7 @@ async def run_pipeline_standard(total: int, concurrency: int) -> dict[str, float
             t0 = time.perf_counter()
             await asyncio.sleep(0.0001)  # Ingest
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                pool, hypertile.native_pipeline_transform, data, 100
-            )
+            await loop.run_in_executor(pool, hypertile.native_pipeline_transform, data, 100)
             await asyncio.sleep(0.0001)  # Egress
             latencies.append((time.perf_counter() - t0) * 1000.0)
 
@@ -130,9 +124,7 @@ async def run_pipeline_hypertile(total: int, concurrency: int) -> dict[str, floa
             t0 = time.perf_counter()
             await asyncio.sleep(0.0001)  # Ingest
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None, hypertile.native_pipeline_transform, data, 100
-            )
+            await loop.run_in_executor(None, hypertile.native_pipeline_transform, data, 100)
             await asyncio.sleep(0.0001)  # Egress
             latencies.append((time.perf_counter() - t0) * 1000.0)
 
@@ -153,9 +145,7 @@ async def run_pipeline_hypertile(total: int, concurrency: int) -> dict[str, floa
     }
 
 
-async def run_pipeline_vectorized(
-    total: int, batch_size: int = 100
-) -> dict[str, float]:
+async def run_pipeline_vectorized(total: int, batch_size: int = 100) -> dict[str, float]:
     payloads = [generate_payload(i) for i in range(total)]
     chunks = [payloads[i : i + batch_size] for i in range(0, total, batch_size)]
     t_start = time.perf_counter()
@@ -179,9 +169,7 @@ def run_suite_2_pipeline(
 ) -> tuple[dict, dict, dict]:
     print(f"\n[Suite 2] Colocated Pipeline Benchmark ({total_requests:,} requests)...")
 
-    print(
-        "  Running baseline without Hypertile (raw C asyncio + ThreadPoolExecutor)..."
-    )
+    print("  Running baseline without Hypertile (raw C asyncio + ThreadPoolExecutor)...")
     std_res = asyncio.run(run_pipeline_standard(total_requests, concurrency))
     print(
         f"    Baseline:          {std_res['req_s']:>10,.0f} req/s (p50: {std_res['p50_ms']:.2f}ms, p99: {std_res['p99_ms']:.2f}ms)"
@@ -212,9 +200,7 @@ def run_suite_2_pipeline(
 
 
 def run_suite_3_dynamic_workers(n_registrations: int = 500) -> float:
-    print(
-        f"\n[Suite 3] Dynamic Worker Registration ({n_registrations} dynamic cycles)..."
-    )
+    print(f"\n[Suite 3] Dynamic Worker Registration ({n_registrations} dynamic cycles)...")
     t0 = time.perf_counter()
     for _ in range(n_registrations):
         with hypertile.register_worker(kind="bilingual") as worker:
@@ -290,7 +276,7 @@ def main():
         f"3. Dynamic Worker Registration works as advertised: external threads join/leave in {dyn_us:.1f} us."
     )
     print(
-        "4. On free-threaded CPython (3.13t/3.14t+), scalar single-hop tasks also beat ThreadPoolExecutor (run free_threaded_showcase.py)."
+        "4. On free-threaded CPython (3.14t), scalar single-hop tasks also beat ThreadPoolExecutor (run free_threaded_showcase.py)."
     )
     print("=" * 92 + "\n")
 

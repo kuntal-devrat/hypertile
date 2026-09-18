@@ -12,16 +12,15 @@
 //! - Panic containment: worker threads wrap polls in `catch_unwind` and return
 //!   [`JoinError::Panicked`] through the [`JoinHandle`] rather than crashing the pool.
 
+use parking_lot::Mutex;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use parking_lot::Mutex;
 use thiserror::Error;
 
-use crate::waker::create_task_waker;
 
 /// Kind of task: native Rust future or interpreter-bound Python coroutine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +110,23 @@ impl<T: Send + 'static> TaskCell<T> {
         self.scheduler.schedule(handle);
     }
 
+    /// Publish the final outcome exactly once and wake the awaiting [`JoinHandle`].
+    ///
+    /// Completion is claimed with a `swap`, so a racing [`JoinHandle::cancel`] can
+    /// never clobber a result that was already produced.
+    fn complete(&self, outcome: Result<T, JoinError>) {
+        let mut result = self.result.lock();
+        if self.state.swap(STATE_COMPLETED, Ordering::AcqRel) != STATE_COMPLETED {
+            *result = Some(outcome);
+            drop(result);
+
+            // Single-hop handoff: wake any continuation awaiting this join handle!
+            if let Some(join_waker) = self.join_waker.lock().take() {
+                join_waker.wake();
+            }
+        }
+    }
+
     /// Mark the task as scheduled if it was idle, and return whether scheduling is needed.
     pub fn mark_scheduled(&self) -> bool {
         loop {
@@ -122,11 +138,16 @@ impl<T: Send + 'static> TaskCell<T> {
                 return false; // Already queued
             }
             if curr == STATE_RUNNING {
-                // Running task woke itself; atomically transition to SCHEDULED so it re-queues
-                // after polling completes.
+                // Running task woke itself (or was woken from another thread); atomically
+                // transition to SCHEDULED so the runner re-queues on completion of the poll.
                 if self
                     .state
-                    .compare_exchange_weak(curr, STATE_SCHEDULED, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange_weak(
+                        curr,
+                        STATE_SCHEDULED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
                     return false;
@@ -139,6 +160,22 @@ impl<T: Send + 'static> TaskCell<T> {
                 .is_ok()
             {
                 return true;
+            }
+        }
+    }
+}
+
+impl<T: Send + 'static> std::task::Wake for TaskCell<T> {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.mark_scheduled() {
+            let handle = TaskHandle::new(self.clone());
+            // Try single-hop handoff onto the current worker, else the global injector.
+            if let Some(handle) = crate::waker::try_push_local(handle) {
+                self.schedule_fallback(handle);
             }
         }
     }
@@ -157,84 +194,72 @@ impl<T: Send + 'static> Runnable for TaskCell<T> {
             )
             .is_err()
         {
-            // Task was already completed or altered
+            // Task was already completed, cancelled, or claimed by another worker.
             return;
         }
 
-        let mut future_slot = self.future.lock();
-        if let Some(mut fut) = future_slot.take() {
-            let waker = create_task_waker(self.clone());
-            let mut cx = Context::from_waker(&waker);
+        // Move the future out of the cell *without* holding the cell's mutex across
+        // `poll`: a future may legitimately cancel its own `JoinHandle` from inside
+        // `poll`, and `parking_lot` mutexes are not re-entrant, so holding the guard
+        // across `poll` would self-deadlock.
+        let Some(mut fut) = self.future.lock().take() else {
+            // Cancelled between the state transition and here; nothing left to poll.
+            return;
+        };
 
-            // Catch panics to prevent poisoning worker threads
-            let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                fut.as_mut().poll(&mut cx)
-            }));
+        let waker: Waker = self.clone().into();
+        let mut cx = Context::from_waker(&waker);
 
-            match poll_result {
-                Ok(Poll::Ready(output)) => {
-                    drop(fut);
-                    *future_slot = None;
-                    drop(future_slot);
+        // Catch panics to prevent poisoning worker threads
+        let poll_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.as_mut().poll(&mut cx)));
 
-                    let mut prev_res = self.result.lock();
-                    let prev_state = self.state.swap(STATE_COMPLETED, Ordering::AcqRel);
-                    if prev_state != STATE_COMPLETED {
-                        *prev_res = Some(Ok(output));
-                        drop(prev_res);
+        match poll_result {
+            Ok(Poll::Ready(output)) => {
+                drop(fut);
+                self.complete(Ok(output));
+            }
+            Ok(Poll::Pending) => {
+                // Publish the future back *before* leaving STATE_RUNNING. While the
+                // state is RUNNING, every racing waker only flips the state to
+                // SCHEDULED and declines to enqueue, so this thread is the sole writer
+                // and the future can never be observed as absent by a stealer.
+                *self.future.lock() = Some(fut);
 
-                        // Single-hop handoff: wake any continuation awaiting this join handle!
-                        if let Some(join_waker) = self.join_waker.lock().take() {
-                            join_waker.wake();
+                loop {
+                    let curr = self.state.load(Ordering::Acquire);
+                    if curr == STATE_COMPLETED {
+                        // Cancelled while polling: release the future immediately and
+                        // do not reschedule.
+                        *self.future.lock() = None;
+                        return;
+                    }
+                    if curr == STATE_SCHEDULED {
+                        // A waker fired during the poll. Re-queue the task ourselves so
+                        // the wake-up is not lost.
+                        let handle = TaskHandle::new(self.clone());
+                        if let Some(handle) = crate::waker::try_push_local(handle) {
+                            self.scheduler.schedule(handle);
                         }
+                        return;
+                    }
+                    if self
+                        .state
+                        .compare_exchange_weak(
+                            curr,
+                            STATE_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
                     }
                 }
-                Ok(Poll::Pending) => {
-                    // Put future back FIRST before modifying state to eliminate data race
-                    *future_slot = Some(fut);
-                    drop(future_slot);
-
-                    // Check if task was cancelled while polling, or woke itself
-                    loop {
-                        let curr = self.state.load(Ordering::Acquire);
-                        if curr == STATE_COMPLETED {
-                            // Task was cancelled during poll: drop future and do not reschedule
-                            *self.future.lock() = None;
-                            break;
-                        }
-                        if curr == STATE_SCHEDULED {
-                            // Task woke itself during poll! Keep state as STATE_SCHEDULED and enqueue
-                            let handle = TaskHandle::new(self.clone());
-                            if !crate::waker::try_single_hop_push(handle.clone()) {
-                                self.scheduler.schedule(handle);
-                            }
-                            break;
-                        }
-                        if self
-                            .state
-                            .compare_exchange_weak(curr, STATE_IDLE, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                        {
-                            break;
-                        }
-                    }
-                }
-                Err(panic_payload) => {
-                    drop(fut);
-                    *future_slot = None;
-                    drop(future_slot);
-
-                    let mut prev_res = self.result.lock();
-                    let prev_state = self.state.swap(STATE_COMPLETED, Ordering::AcqRel);
-                    if prev_state != STATE_COMPLETED {
-                        *prev_res = Some(Err(JoinError::Panicked(panic_payload)));
-                        drop(prev_res);
-
-                        if let Some(join_waker) = self.join_waker.lock().take() {
-                            join_waker.wake();
-                        }
-                    }
-                }
+            }
+            Err(panic_payload) => {
+                drop(fut);
+                self.complete(Err(JoinError::Panicked(panic_payload)));
             }
         }
     }

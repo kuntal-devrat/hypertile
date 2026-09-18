@@ -1,0 +1,49 @@
+name: Feature request
+description: Propose a new capability or API
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case, not just the API you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Sketch the API or behaviour you expect. Alternatives you considered are welcome.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface does this touch?
+      options:
+        - Python API (hypertile.*)
+        - Rust core (hypertile-core)
+        - C / C++ ABI (hypertile-capi, include/hypertile.h)
+        - Docs, examples or benchmarks
+        - Build, packaging or CI
+    validations:
+      required: true
+
+  - type: dropdown
+    id: threading
+    attributes:
+      label: Does it depend on free-threading (PEP 779)?
+      options:
+        - Works on both GIL and free-threaded builds
+        - Only meaningful on free-threaded builds
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Prior art, related issues, or measurements that motivate the request.

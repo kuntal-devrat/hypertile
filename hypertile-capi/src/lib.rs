@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crossbeam_utils::sync::Parker;
 use hypertile_core::{
-    global_runtime, register_worker as core_register_worker, RegisteredWorker as CoreRegisteredWorker,
-    WorkerKind,
+    global_runtime, init_global_runtime, register_worker as core_register_worker,
+    RegisteredWorker as CoreRegisteredWorker, WorkerKind,
 };
 use parking_lot::Mutex;
 
@@ -45,7 +45,7 @@ pub type HypertileCallbackFn = unsafe extern "C-unwind" fn(*mut c_void, *mut c_v
 pub struct HypertileTaskInner {
     result: Mutex<Option<Result<usize, String>>>,
     done: AtomicBool,
-    unparker: Mutex<Option<crossbeam_utils::sync::Unparker>>,
+    unparkers: Mutex<Vec<crossbeam_utils::sync::Unparker>>,
 }
 
 /// Opaque task handle representing a spawned unit of work.
@@ -59,15 +59,17 @@ thread_local! {
 
 /// Initialize Hypertile's global work-stealing runtime.
 ///
-/// If `num_workers` is 0, the pool defaults to the number of logical CPU cores.
-/// Calling this function multiple times is safe and idempotent.
+/// If `num_workers` is 0, the pool uses the default size (the logical CPU count plus a
+/// small blocking headroom, capped; see [`hypertile_core::default_worker_count`]). The
+/// `HYPERTILE_WORKERS` environment variable overrides that default. Calling this
+/// function multiple times is safe and idempotent; only the first call determines the
+/// worker count, and a pool cannot be resized afterwards.
 ///
 /// # Safety
 /// Must be called from an environment where thread spawning is permitted.
 #[no_mangle]
 pub unsafe extern "C" fn hypertile_init(num_workers: usize) -> i32 {
-    let _ = num_workers; // global_runtime initializes with core count
-    let _ = global_runtime();
+    let _ = init_global_runtime(num_workers);
     HypertileStatus::Ok as i32
 }
 
@@ -85,7 +87,9 @@ pub unsafe extern "C" fn hypertile_shutdown() -> i32 {
 /// Return version string for the Hypertile C ABI.
 #[no_mangle]
 pub extern "C" fn hypertile_version() -> *const c_char {
-    static VERSION: &[u8] = b"0.1.1\0";
+    // Kept in lockstep with the crate version so the ABI can never report a stale
+    // release number.
+    static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
     VERSION.as_ptr() as *const c_char
 }
 
@@ -110,18 +114,18 @@ pub unsafe extern "C" fn hypertile_spawn(
     let inner = Arc::new(HypertileTaskInner {
         result: Mutex::new(None),
         done: AtomicBool::new(false),
-        unparker: Mutex::new(None),
+        unparkers: Mutex::new(Vec::new()),
     });
 
     let inner_clone = inner.clone();
-    let fn_addr = work_fn as usize;
+    // Function pointers are `Send + Sync + Copy` and can be captured directly; only
+    // the bare data pointer has to cross the thread boundary as an integer.
     let arg_addr = arg as usize;
 
     let rt = global_runtime();
     rt.spawn(async move {
         let work_res = catch_unwind(AssertUnwindSafe(|| {
-            let f: HypertileWorkFn = std::mem::transmute(fn_addr);
-            let ret = f(arg_addr as *mut c_void);
+            let ret = unsafe { work_fn(arg_addr as *mut c_void) };
             ret as usize
         }));
 
@@ -142,7 +146,11 @@ pub unsafe extern "C" fn hypertile_spawn(
         *inner_clone.result.lock() = Some(mapped_res);
         inner_clone.done.store(true, Ordering::Release);
 
-        if let Some(unparker) = inner_clone.unparker.lock().take() {
+        let unparkers = {
+            let mut guard = inner_clone.unparkers.lock();
+            std::mem::take(&mut *guard)
+        };
+        for unparker in unparkers {
             unparker.unpark();
         }
     });
@@ -214,11 +222,11 @@ pub unsafe extern "C" fn hypertile_wait(
         let unparker = parker.unparker().clone();
 
         {
-            let mut unpark_guard = task_ref.inner.unparker.lock();
+            let mut guard = task_ref.inner.unparkers.lock();
             if !task_ref.inner.done.load(Ordering::Acquire) {
-                *unpark_guard = Some(unparker);
+                guard.push(unparker);
             } else {
-                drop(unpark_guard);
+                drop(guard);
             }
         }
 
@@ -281,16 +289,13 @@ pub unsafe extern "C" fn hypertile_spawn_with_callback(
         None => return HypertileStatus::ErrInvalidArg as i32,
     };
 
-    let fn_addr = work_fn as usize;
     let arg_addr = arg as usize;
-    let cb_addr = cb_fn as usize;
-    let ud_addr = user_data as usize;
+    let user_data_addr = user_data as usize;
 
     let rt = global_runtime();
     rt.spawn(async move {
         let work_res = catch_unwind(AssertUnwindSafe(|| {
-            let f: HypertileWorkFn = std::mem::transmute(fn_addr);
-            let ret = f(arg_addr as *mut c_void);
+            let ret = unsafe { work_fn(arg_addr as *mut c_void) };
             ret as usize
         }));
 
@@ -299,9 +304,8 @@ pub unsafe extern "C" fn hypertile_spawn_with_callback(
             Err(_) => std::ptr::null_mut(),
         };
 
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            let cb: HypertileCallbackFn = std::mem::transmute(cb_addr);
-            cb(final_result, ud_addr as *mut c_void);
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            cb_fn(final_result, user_data_addr as *mut c_void);
         }));
     });
 
@@ -338,39 +342,39 @@ pub unsafe extern "C" fn hypertile_batch_spawn(
     let num_workers = rt.core().registry().active_count().max(1);
     let num_chunks = (num_workers * 4).min(count).max(1);
     let chunk_size = count.div_ceil(num_chunks);
+    let actual_chunks = count.div_ceil(chunk_size);
 
-    let remaining = Arc::new(AtomicUsize::new(num_chunks));
+    let remaining = Arc::new(AtomicUsize::new(actual_chunks));
+    let had_panic = Arc::new(AtomicBool::new(false));
     let parker = Parker::new();
     let unparker = parker.unparker().clone();
 
     let args_slice = std::slice::from_raw_parts(args, count);
     let out_slice = std::slice::from_raw_parts_mut(out_results, count);
 
-    let fn_addr = work_fn as usize;
     let args_addr = args_slice.as_ptr() as usize;
     let out_addr = out_slice.as_mut_ptr() as usize;
 
-    for chunk_idx in 0..num_chunks {
+    for chunk_idx in 0..actual_chunks {
         let start = chunk_idx * chunk_size;
         let end = (start + chunk_size).min(count);
-        if start >= end {
-            remaining.fetch_sub(1, Ordering::Relaxed);
-            continue;
-        }
 
         let rem = remaining.clone();
         let unp = unparker.clone();
+        let panic_flag = had_panic.clone();
 
         rt.spawn(async move {
-            let f: HypertileWorkFn = unsafe { std::mem::transmute(fn_addr) };
             let in_base = args_addr as *const *mut c_void;
             let out_base = out_addr as *mut *mut c_void;
 
             for i in start..end {
                 let arg = unsafe { *in_base.add(i) };
-                let res = match catch_unwind(AssertUnwindSafe(|| unsafe { f(arg) })) {
+                let res = match catch_unwind(AssertUnwindSafe(|| unsafe { work_fn(arg) })) {
                     Ok(r) => r,
-                    Err(_) => std::ptr::null_mut(),
+                    Err(_) => {
+                        panic_flag.store(true, Ordering::Release);
+                        std::ptr::null_mut()
+                    }
                 };
                 unsafe { *out_base.add(i) = res };
             }
@@ -385,7 +389,11 @@ pub unsafe extern "C" fn hypertile_batch_spawn(
         parker.park();
     }
 
-    HypertileStatus::Ok as i32
+    if had_panic.load(Ordering::Acquire) {
+        HypertileStatus::ErrPanic as i32
+    } else {
+        HypertileStatus::Ok as i32
+    }
 }
 
 /// Register the current calling thread as an auxiliary worker in the pool.
@@ -414,20 +422,23 @@ pub unsafe extern "C" fn hypertile_register_worker() -> u64 {
 /// The calling thread must be registered as a worker.
 #[no_mangle]
 pub unsafe extern "C" fn hypertile_worker_run_until_idle() -> i32 {
-    let has_worker = THREAD_WORKER.with(|w| {
-        if let Some(ref worker) = *w.borrow() {
-            worker.run_until_idle();
-            true
-        } else {
-            false
+    // Move the registration out of thread-local storage while user code runs, so a
+    // task that re-registers or deregisters this thread cannot trip a `RefCell`
+    // borrow panic.
+    let Some(worker) = THREAD_WORKER.with(|w| w.borrow_mut().take()) else {
+        return HypertileStatus::ErrWorkerNotRegistered as i32;
+    };
+
+    worker.run_until_idle();
+
+    THREAD_WORKER.with(|w| {
+        let mut slot = w.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(worker);
         }
     });
 
-    if has_worker {
-        HypertileStatus::Ok as i32
-    } else {
-        HypertileStatus::ErrWorkerNotRegistered as i32
-    }
+    HypertileStatus::Ok as i32
 }
 
 /// Deregister the current thread from the worker pool.

@@ -1,5 +1,6 @@
 """Signal handling and cooperative cancellation coordination for Hypertile."""
 
+import contextlib
 import signal
 from weakref import WeakSet
 
@@ -22,10 +23,10 @@ def setup_signal_handlers() -> None:
             def sigint_handler(sig, frame):
                 # Trigger cancellation on all active in-flight native tasks
                 for token in list(_ACTIVE_TOKENS):
-                    try:
+                    with contextlib.suppress(Exception):
                         token.cancel()
-                    except Exception:  # noqa: S110, BLE001
-                        pass
+                if _ORIGINAL_SIGINT_HANDLER == signal.SIG_IGN:
+                    return
                 if callable(_ORIGINAL_SIGINT_HANDLER):
                     _ORIGINAL_SIGINT_HANDLER(sig, frame)
                 else:

@@ -1,0 +1,119 @@
+name: Sanitizers
+
+# The race harness deliberately lets real threads race, which is what surfaces real races.
+# Sanitizers sharpen that: ThreadSanitizer detects data races that a passing run would
+# miss, and AddressSanitizer catches use-after-free in the worker registry and the C ABI.
+#
+# These run on Linux with a nightly toolchain because both require `-Zsanitizer` and
+# `-Zbuild-std` (an instrumented `std`). They are deliberately NOT part of every PR:
+# sanitizer builds are slow and, for ThreadSanitizer, keep a large shadow-memory footprint.
+# The seed-sweeping stress run lives in `race-stress` below; `scripts/race_stress.sh`
+# reproduces it locally.
+
+on:
+  schedule:
+    # Weekly, Monday 03:17 UTC. Off the hour to avoid the scheduled-job stampede.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  thread-sanitizer:
+    name: ThreadSanitizer (race harness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # `-Zbuild-std` needs the standard library sources.
+          components: rust-src
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      # Recent kernels use more address-space randomness than ThreadSanitizer's shadow
+      # mapping tolerates, which makes it abort with "unexpected memory mapping" before
+      # any test runs. Lowering the entropy is the documented workaround.
+      - name: Relax ASLR entropy for ThreadSanitizer
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Run race harness under ThreadSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=thread -Cdebuginfo=1
+          RUSTDOCFLAGS: -Zsanitizer=thread
+          # A detected race must fail the job, not be logged and swallowed.
+          TSAN_OPTIONS: halt_on_error=1
+          HYPERTILE_RACE_SEED: "1"
+          HYPERTILE_RACE_ITERATIONS: "40"
+          HYPERTILE_RACE_CHURN_ITERATIONS: "10"
+          HYPERTILE_RACE_TIMEOUT_SECS: "120"
+        run: |
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p hypertile-core --test race_harness -- --test-threads=1 --nocapture
+
+  address-sanitizer:
+    name: AddressSanitizer (core + C ABI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      - name: Run core and C ABI tests under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address -Cdebuginfo=1
+          RUSTDOCFLAGS: -Zsanitizer=address
+          # Leak detection is off: Rust's runtime and the runtime's detached worker
+          # threads produce exit-time reports that are unrelated to this crate's own
+          # accounting. Registry leaks are asserted directly instead (the harness checks
+          # `registry().active_count() == 0`), which is a precise check rather than a
+          # process-exit heuristic.
+          ASAN_OPTIONS: detect_leaks=0
+          HYPERTILE_RACE_SEED: "1"
+          HYPERTILE_RACE_ITERATIONS: "25"
+          HYPERTILE_RACE_CHURN_ITERATIONS: "8"
+          HYPERTILE_RACE_TIMEOUT_SECS: "120"
+        run: |
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu \
+            -p hypertile-core -p hypertile-capi -- --test-threads=1
+
+  race-stress:
+    name: Seeded stress sweep (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      - name: Sweep seeds
+        env:
+          HYPERTILE_STRESS_SEEDS: "24"
+          HYPERTILE_RACE_ITERATIONS: "120"
+          HYPERTILE_RACE_CHURN_ITERATIONS: "30"
+          HYPERTILE_RACE_TIMEOUT_SECS: "60"
+        run: bash scripts/race_stress.sh "${{ matrix.mode }}"
+      - name: Upload seed logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: race-stress-logs-${{ matrix.mode }}
+          path: /tmp/hypertile-race-seed-*.log
+          if-no-files-found: ignore

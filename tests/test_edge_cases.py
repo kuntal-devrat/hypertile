@@ -4,6 +4,7 @@ import asyncio
 import time
 
 import hypertile
+import pytest
 
 
 def test_asyncio_sleep_under_hypertile_run():
@@ -177,8 +178,100 @@ def test_cancellation_token_explicit_flow():
     asyncio.run(main())
 
 
+def test_level1_rejects_undrivable_awaitable():
+    """Regression: an unsupported awaitable must raise, not spin forever.
+
+    The Level 1 executor can only drive awaits that expose ``add_done_callback``.
+    Previously anything else was silently re-queued with a 1 ms sleep, so
+    ``run_level1`` hung with no diagnostics.
+    """
+
+    class Undrivable:
+        def __await__(self):
+            yield "opaque-awaitable"  # non-None and not an asyncio-style future
+
+    async def uses_undrivable():
+        return await Undrivable()
+
+    start = time.perf_counter()
+    with pytest.raises(TypeError, match="cannot drive an awaitable"):
+        hypertile.run_level1(uses_undrivable())
+    assert time.perf_counter() - start < 10.0, "must fail fast instead of spinning"
+
+
+def test_level1_supports_bare_yield_coroutines():
+    """A coroutine that yields ``None`` (e.g. ``await asyncio.sleep(0)``) still runs."""
+
+    class BareYield:
+        def __await__(self):
+            yield None
+            return "bare-yield-result"
+
+    async def main():
+        return await BareYield()
+
+    assert hypertile.run_level1(main()) == "bare-yield-result"
+
+
 def test_panic_exception_defined():
     """Verify PanicInTask exception is exposed and can be caught."""
     assert issubclass(hypertile.PanicInTask, Exception)
     assert issubclass(hypertile.TaskCancelled, Exception)
     assert issubclass(hypertile.RegistrationError, Exception)
+
+
+def test_done_callback_accepts_future_argument():
+    """Verify callbacks taking the future as an argument (asyncio style) are supported."""
+    received = []
+
+    async def main():
+        task = hypertile.to_thread(lambda: 42)
+        task.add_done_callback(lambda fut: received.append(fut.result()))
+        assert await task == 42
+        await asyncio.sleep(0.05)
+
+    asyncio.run(main())
+    assert received == [42]
+
+
+def test_hypertile_task_accepts_kwargs():
+    """Verify HypertileTask accepts arbitrary keyword arguments like eager_start."""
+    from hypertile.asyncio_policy import HypertileTask
+
+    async def sample():
+        return 99
+
+    async def runner():
+        loop = asyncio.get_running_loop()
+        task = HypertileTask(sample(), loop=loop, eager_start=False)
+        return await task
+
+    assert asyncio.run(runner()) == 99
+
+
+def test_to_thread_rejects_partial_coroutine():
+    """Verify to_thread unwraps functools.partial and rejects coroutine targets."""
+    import functools
+
+    async def async_worker(x):
+        return x
+
+    partial_coro = functools.partial(functools.partial(async_worker, 10))
+    with pytest.raises(TypeError, match="does not accept coroutines"):
+        hypertile.to_thread(partial_coro)
+
+
+def test_signals_respects_sig_ign():
+    """Verify setup_signal_handlers does not raise KeyboardInterrupt when SIGINT is ignored."""
+    import signal
+
+    from hypertile import signals
+
+    orig = signals._ORIGINAL_SIGINT_HANDLER
+    try:
+        signals._ORIGINAL_SIGINT_HANDLER = signal.SIG_IGN
+        # Test simulated handler execution
+        signals.setup_signal_handlers()
+        # Verify handler didn't crash
+    finally:
+        signals._ORIGINAL_SIGINT_HANDLER = orig

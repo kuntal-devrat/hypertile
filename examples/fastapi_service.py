@@ -25,9 +25,7 @@ try:
     from fastapi import FastAPI
     from pydantic import BaseModel
 except ImportError:
-    print(
-        "FastAPI is not installed in the current environment. Run: uv pip install fastapi"
-    )
+    print("FastAPI is not installed in the current environment. Run: uv pip install fastapi")
     import sys
 
     sys.exit(0)
@@ -60,9 +58,7 @@ def cpu_heavy_hash(data: str, iterations: int = 10_000) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager that joins the Hypertile executor pool."""
-    print(
-        "[Hypertile FastAPI] Starting up: Registering worker into work-stealing pool..."
-    )
+    print("[Hypertile FastAPI] Starting up: Registering worker into work-stealing pool...")
     worker = None
     try:
         worker = hypertile.register_worker(kind="bilingual")
@@ -157,9 +153,7 @@ if __name__ == "__main__":
     with TestClient(app) as client:
         # Test 1: Health check
         res_health = client.get("/health")
-        print(
-            f"GET  /health                  -> {res_health.status_code} | {res_health.json()}"
-        )
+        print(f"GET  /health                  -> {res_health.status_code} | {res_health.json()}")
 
         # Test 2: Hypertile Task Offloading
         t0 = time.perf_counter()

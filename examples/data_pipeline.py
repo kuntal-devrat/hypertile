@@ -41,17 +41,13 @@ def stage1_parse_record(raw_record: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def process_record(
-    raw_record: dict[str, Any], rounds: int = 50
-) -> dict[str, Any]:
+async def process_record(raw_record: dict[str, Any], rounds: int = 50) -> dict[str, Any]:
     """Process a single record through the 2-stage Hypertile pipeline."""
     # Stage 1: Offload parsing via hypertile.to_thread
     parsed = await hypertile.to_thread(stage1_parse_record, raw_record)
 
     # Stage 2: Direct single-hop native compute task
-    native_task = hypertile.spawn_native_pipeline(
-        parsed["clean_payload"], rounds=rounds
-    )
+    native_task = hypertile.spawn_native_pipeline(parsed["clean_payload"], rounds=rounds)
     transformed_bytes = await native_task
 
     return {
@@ -61,13 +57,10 @@ async def process_record(
     }
 
 
-async def run_batch_pipeline(
-    num_records: int = 500, concurrency: int = 64
-) -> dict[str, float]:
+async def run_batch_pipeline(num_records: int = 500, concurrency: int = 64) -> dict[str, float]:
     """Run a high-concurrency batch pipeline over synthetic records."""
     records = [
-        {"id": i, "payload": f"record-payload-batch-chunk-{i:06d}-data"}
-        for i in range(num_records)
+        {"id": i, "payload": f"record-payload-batch-chunk-{i:06d}-data"} for i in range(num_records)
     ]
 
     sem = asyncio.Semaphore(concurrency)
@@ -122,17 +115,11 @@ async def main():
 
         # Step 2: Run pipeline benchmark
         num_items = 1_000
-        print(
-            f"\n[Step 2] Executing {num_items:,} multi-stage pipeline items (concurrency=128)..."
-        )
+        print(f"\n[Step 2] Executing {num_items:,} multi-stage pipeline items (concurrency=128)...")
         stats = await run_batch_pipeline(num_records=num_items, concurrency=128)
 
-        print(
-            f"  -> Processed {int(stats['count']):,} items in {stats['total_time_ms']:.2f} ms"
-        )
-        print(
-            f"  -> Pipeline Throughput: {stats['throughput_records_sec']:,.0f} records/sec"
-        )
+        print(f"  -> Processed {int(stats['count']):,} items in {stats['total_time_ms']:.2f} ms")
+        print(f"  -> Pipeline Throughput: {stats['throughput_records_sec']:,.0f} records/sec")
 
     print("  -> Auxiliary worker gracefully deregistered.")
 
@@ -151,9 +138,7 @@ async def main():
     batch_results = await batch_task
     t_v_elapsed = time.perf_counter() - t_v0
     print(f"  -> Processed {len(batch_results):,} items in {t_v_elapsed * 1000:.2f} ms")
-    print(
-        f"  -> Vectorized Throughput: {len(batch_results) / t_v_elapsed:,.0f} records/sec"
-    )
+    print(f"  -> Vectorized Throughput: {len(batch_results) / t_v_elapsed:,.0f} records/sec")
 
     print("\n" + "=" * 72)
     print("Data pipeline executed successfully!")

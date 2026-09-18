@@ -1,42 +1,78 @@
 [build-system]
-requires = ["maturin>=1.5,<2.0"]
+requires = ["maturin>=1.8,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "hypertile"
-version = "0.1.1"
+# Kept in sync with the workspace version in Cargo.toml; verified by
+# tests/test_hypertile.py::test_version_metadata_is_consistent_across_manifests.
+version = "0.1.2"
 description = "A shared, work-stealing executor for free-threaded Python coroutines and Send Rust futures"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT OR Apache-2.0" }
+# PEP 639 SPDX expression (the legacy `license = { text = ... }` table is deprecated).
+license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-APACHE", "LICENSE-MIT"]
 authors = [{ name = "Hypertile Contributors" }]
+keywords = [
+    "asyncio",
+    "async",
+    "concurrency",
+    "free-threading",
+    "nogil",
+    "pyo3",
+    "rust",
+    "threadpool",
+    "work-stealing",
+]
 classifiers = [
-    "Programming Language :: Rust",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
     "Framework :: AsyncIO",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kuntal-devrat/hypertile"
+Repository = "https://github.com/kuntal-devrat/hypertile"
+Documentation = "https://github.com/kuntal-devrat/hypertile#readme"
+Changelog = "https://github.com/kuntal-devrat/hypertile/blob/main/CHANGELOG.md"
+Issues = "https://github.com/kuntal-devrat/hypertile/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
 manifest-path = "hypertile-sys/Cargo.toml"
 module-name = "hypertile._hypertile_sys"
 python-source = "python"
-include = ["python/hypertile/py.typed", "python/hypertile/__init__.pyi", "python/hypertile/_hypertile_sys.pyi"]
+include = [
+    "python/hypertile/py.typed",
+    "python/hypertile/__init__.pyi",
+    "python/hypertile/_hypertile_sys.pyi",
+]
 sdist-include = ["LICENSE-APACHE", "LICENSE-MIT"]
 
-[tool.pyright]
-include = ["python", "tests", "examples", "benches", "showcase"]
-extraPaths = ["python"]
-venvPath = "."
-venv = ".venv"
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# Note: pyright is configured in pyrightconfig.json (pyright prefers it over
+# [tool.pyright]), so it is deliberately not duplicated here.
 
 [tool.ruff]
+line-length = 100
 exclude = [".venv*", "target"]
+
+[tool.ruff.lint]
+select = ["B", "BLE", "C4", "E", "F", "I", "RUF", "SIM", "UP", "W"]
+# The showcase/benchmark scripts use long, deliberately aligned report rows.
+ignore = ["E501"]

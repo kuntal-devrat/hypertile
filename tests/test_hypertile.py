@@ -1,13 +1,117 @@
 """Comprehensive test suite for Hypertile Python package."""
 
 import asyncio
+import os
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
 
 import hypertile
 import pytest
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _run_child(
+    tmp_path: Path,
+    body: str,
+    *,
+    env: dict[str, str] | None = None,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess:
+    """Run `body` in a fresh interpreter and return the completed process.
+
+    Child interpreters are how these tests exercise process-global state - the worker
+    pool's size and lifetime - without disturbing the pool this suite is already using.
+    ``env`` is merged onto the parent environment so the child still inherits
+    ``PYTHONPATH`` and can import the package under test.
+    """
+    script = tmp_path / "child.py"
+    script.write_text(body, encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        timeout=timeout,
+        cwd=str(PROJECT_ROOT),
+        check=False,
+        env=None if env is None else {**os.environ, **env},
+    )
+
+
+def test_version_metadata_is_consistent_across_manifests():
+    """Cargo, PyPI and Python metadata must never drift apart."""
+    workspace = tomllib.loads((PROJECT_ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    workspace_version = workspace["workspace"]["package"]["version"]
+
+    for crate in ("hypertile-core", "hypertile-sys", "hypertile-capi"):
+        manifest = PROJECT_ROOT / crate / "Cargo.toml"
+        declared = tomllib.loads(manifest.read_text(encoding="utf-8"))["package"]["version"]
+        if isinstance(declared, dict):  # `version.workspace = true`
+            assert declared.get("workspace") is True, crate
+            declared = workspace_version
+        assert declared == workspace_version, f"{crate} version drifts from the workspace"
+
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["version"] == workspace_version
+    assert hypertile.__version__ == workspace_version
+
+    native = pytest.importorskip("hypertile._hypertile_sys")
+    assert native.__version__ == workspace_version
+
+
+def test_shutdown_hook_stops_the_native_pool(tmp_path):
+    """The exit hook must actually stop the pool, not just exist.
+
+    Exercised in a child interpreter because it stops the process-wide pool, which the
+    rest of this suite still needs.
+    """
+    assert hypertile._NATIVE_EXTENSION_AVAILABLE
+    assert callable(hypertile._shutdown_background_workers)
+    assert hasattr(hypertile._hypertile_sys, "shutdown")
+
+    proc = _run_child(
+        tmp_path,
+        "import asyncio\n"
+        "import hypertile\n"
+        "\n"
+        "async def main():\n"
+        "    assert await hypertile.to_thread(lambda: 1) == 1\n"
+        "    hypertile._shutdown_background_workers()\n"
+        "    # Once stopped, dispatch can never complete - which is what must happen\n"
+        "    # before the interpreter is torn down under the workers' feet.\n"
+        "    try:\n"
+        "        await asyncio.wait_for(hypertile.to_thread(lambda: 2), timeout=1.0)\n"
+        "    except (asyncio.TimeoutError, TimeoutError):\n"
+        "        return 'stopped'\n"
+        "    raise SystemExit('pool still running after shutdown')\n"
+        "\n"
+        "assert asyncio.run(main()) == 'stopped'\n"
+        "# Idempotent: a second call must not hang or raise.\n"
+        "hypertile._shutdown_background_workers()\n",
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+
+
+def test_clean_interpreter_exit_after_background_work(tmp_path):
+    """Regression: worker threads must not outlive (or hang) the interpreter."""
+    proc = _run_child(
+        tmp_path,
+        "import asyncio, sys\n"
+        "import hypertile\n"
+        "\n"
+        "async def main():\n"
+        "    return await hypertile.to_thread(lambda: 1)\n"
+        "\n"
+        "assert asyncio.run(main()) == 1\n"
+        "sys.exit(0)\n",
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+
 
 def test_version_and_exports():
-    assert hypertile.__version__ == "0.1.1"
+    assert hypertile.__version__ == "0.1.2"
     assert hasattr(hypertile, "run")
     assert hasattr(hypertile, "install")
     assert hasattr(hypertile, "register_worker")
@@ -21,6 +125,119 @@ def test_version_and_exports():
     assert hasattr(hypertile, "native_pipeline_transform")
     assert hasattr(hypertile, "BatchNativeTask")
     assert hasattr(hypertile, "BatchCallableTask")
+    assert hasattr(hypertile, "configure")
+    assert hasattr(hypertile, "worker_count")
+    assert hasattr(hypertile, "default_worker_count")
+
+
+def test_default_pool_size_never_undercuts_the_cpu_count():
+    """The default must serve both workload shapes.
+
+    A pool smaller than the logical CPU count throws away compute parallelism; a pool of
+    *exactly* the CPU count serialises blocking calls, which is measurably slower than
+    the standard library's default executor for the `to_thread` use case. So the default
+    must be at least one worker per logical CPU, and larger on small machines.
+    """
+    cores = os.cpu_count() or 1
+    default = hypertile.default_worker_count()
+
+    assert default >= cores, f"{default} workers cannot saturate {cores} CPUs"
+    assert default <= max(cores, 32)
+    if cores < 32:
+        assert default > cores, (
+            f"a {cores}-core machine needs blocking headroom, not exactly {cores} workers"
+        )
+    # A compute-heavy caller can always ask for fewer; the point is the default.
+    assert isinstance(default, int)
+
+
+def test_worker_count_is_none_until_the_pool_starts(tmp_path):
+    """`worker_count()` must report the pool as not-yet-started, not guess.
+
+    Runs in a child interpreter: this process's pool is already running.
+    """
+    proc = _run_child(
+        tmp_path,
+        "import hypertile\n"
+        "assert hypertile.worker_count() is None, hypertile.worker_count()\n"
+        "# Merely importing (and installing the asyncio policy) must not start it.\n"
+        "hypertile.install()\n"
+        "assert hypertile.worker_count() is None\n",
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+
+
+def test_configure_sizes_the_pool_then_refuses_to_resize(tmp_path):
+    """The pool is process-wide and fixed once used, so the API must say so."""
+    proc = _run_child(
+        tmp_path,
+        "import asyncio\n"
+        "import hypertile\n"
+        "\n"
+        "assert hypertile.configure(workers=2) == 2\n"
+        "assert hypertile.worker_count() == 2\n"
+        "\n"
+        "async def main():\n"
+        "    # A 2-worker pool must actually run work. Bind `i` per-submission: the\n"
+        "    # callable runs later, on a worker, so a bare closure would see the last `i`.\n"
+        "    return await asyncio.gather(\n"
+        "        *(hypertile.to_thread(lambda i=i: i) for i in range(8))\n"
+        "    )\n"
+        "\n"
+        "assert asyncio.run(main()) == list(range(8))\n"
+        "assert hypertile.worker_count() == 2\n"
+        "\n"
+        "# Resizing a running pool must fail loudly rather than be ignored, and the\n"
+        "# message must name the size that is actually in use.\n"
+        "try:\n"
+        "    hypertile.configure(workers=4)\n"
+        "except RuntimeError as exc:\n"
+        "    assert 'already started' in str(exc), exc\n"
+        "    assert 'HYPERTILE_WORKERS' in str(exc), exc\n"
+        "else:\n"
+        "    raise SystemExit('resizing a running pool did not raise')\n"
+        "assert hypertile.worker_count() == 2, 'a refused configure must not resize'\n",
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+
+
+def test_workers_env_var_sizes_a_pool_started_by_other_code(tmp_path):
+    """The env var is the escape hatch for pools someone else starts first."""
+    proc = _run_child(
+        tmp_path,
+        "import asyncio\n"
+        "import hypertile\n"
+        "\n"
+        "assert hypertile.worker_count() is None\n"
+        "\n"
+        "async def main():\n"
+        "    # No configure() call: the env var must size the pool on first use.\n"
+        "    await hypertile.to_thread(lambda: 1)\n"
+        "\n"
+        "asyncio.run(main())\n"
+        "assert hypertile.worker_count() == 3, hypertile.worker_count()\n",
+        env={"HYPERTILE_WORKERS": "3"},
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+
+
+def test_invalid_workers_env_var_falls_back_to_the_default(tmp_path):
+    """A bad value must not silently become an arbitrary pool size."""
+    proc = _run_child(
+        tmp_path,
+        "import asyncio\n"
+        "import hypertile\n"
+        "\n"
+        "async def main():\n"
+        "    await hypertile.to_thread(lambda: 1)\n"
+        "\n"
+        "asyncio.run(main())\n"
+        "assert hypertile.worker_count() == hypertile.default_worker_count()\n",
+        env={"HYPERTILE_WORKERS": "not-a-number"},
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+    # The misconfiguration must be reported, not swallowed.
+    assert b"HYPERTILE_WORKERS" in proc.stderr
 
 
 def test_cancellation_token():
@@ -217,6 +434,38 @@ def test_callable_task_repeated_await_and_result():
         assert res3 == 99
 
     asyncio.run(main())
+
+
+def test_done_callback_after_completion_fires_exactly_once():
+    """Regression: registering a callback on a finished task must not be lost."""
+
+    async def main():
+        task = hypertile.to_thread(lambda: 5)
+        assert await task == 5
+
+        calls = []
+        task.add_done_callback(lambda: calls.append("first"))
+        task.add_done_callback(lambda: calls.append("second"))
+        await asyncio.sleep(0)
+        return calls
+
+    assert asyncio.run(main()) == ["first", "second"]
+
+
+def test_done_callback_before_completion_fires_exactly_once():
+    """The completion race must not drop or duplicate a pending callback."""
+
+    async def main():
+        task = hypertile.to_thread(lambda: (time.sleep(0.05), "done")[1])
+        calls = []
+        for i in range(8):
+            task.add_done_callback(lambda i=i: calls.append(i))
+
+        assert await task == "done"
+        await asyncio.sleep(0.1)
+        return sorted(calls)
+
+    assert asyncio.run(main()) == list(range(8))
 
 
 def test_to_thread_rejects_coroutine():

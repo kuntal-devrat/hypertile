@@ -1,12 +1,16 @@
-"""Free-Threaded (No-GIL) Python 3.13t Benchmark Showcase.
+"""Free-Threaded (No-GIL) Python Benchmark Showcase.
 
 Compares:
   Mode A: Standard ThreadPoolExecutor offload (asyncio.run_in_executor)
   Mode B: Hypertile Direct Native Task (await hypertile.spawn_native_pipeline)
 
-On Python 3.13t with free-threading (PEP 779), the GIL is disabled.
-This benchmark directly compares the double-hop offload mechanism against
-Hypertile's direct native work-stealing continuation.
+On a free-threaded build (PEP 779, Python 3.14t), the GIL is disabled. This benchmark
+directly compares the double-hop offload mechanism against Hypertile's direct native
+work-stealing continuation.
+
+The figures recorded in the README were produced on Python 3.13t, which Hypertile no
+longer builds for (PyO3 dropped free-threaded 3.13 when it added 3.14). The script runs
+unchanged on 3.14t - re-run it there for current numbers.
 """
 
 import asyncio
@@ -45,9 +49,7 @@ async def run_standard_suite(total: int, concurrency: int) -> dict[str, float]:
             await asyncio.sleep(0.0001)  # Async ingest
             loop = asyncio.get_running_loop()
             # Standard threadpool offload (double-hop)
-            await loop.run_in_executor(
-                pool, hypertile.native_pipeline_transform, data, 100
-            )
+            await loop.run_in_executor(pool, hypertile.native_pipeline_transform, data, 100)
             await asyncio.sleep(0.0001)  # Async egress
             latencies.append((time.perf_counter() - t0) * 1000.0)
 
@@ -109,9 +111,7 @@ async def run_hypertile_direct_suite(total: int, concurrency: int) -> dict[str, 
 # ============================================================================
 
 
-async def run_vectorized_batch_suite(
-    total: int, batch_size: int = 100
-) -> dict[str, float]:
+async def run_vectorized_batch_suite(total: int, batch_size: int = 100) -> dict[str, float]:
     payloads = [generate_payload(i) for i in range(total)]
     chunks = [payloads[i : i + batch_size] for i in range(0, total, batch_size)]
 

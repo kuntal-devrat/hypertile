@@ -7,13 +7,13 @@
 //! - Immediate unparking of idle workers upon injection
 //! - Implements [`TaskScheduler`] for cross-thread wakes and global dispatch
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use crossbeam_deque::{Injector, Steal, Stealer};
 use crossbeam_utils::sync::Unparker;
 use crossbeam_utils::CachePadded;
 use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::task::{JoinHandle, RawTask, TaskHandle, TaskScheduler};
 
@@ -49,6 +49,12 @@ pub struct WorkerRegistry {
     next_id: AtomicUsize,
 }
 
+/// First worker ID handed out.
+///
+/// IDs start at 1 so that `0` can unambiguously mean "no worker"/failure across the
+/// C ABI and the Python bindings.
+const FIRST_WORKER_ID: WorkerId = 1;
+
 impl Default for WorkerRegistry {
     fn default() -> Self {
         Self::new()
@@ -62,11 +68,11 @@ impl WorkerRegistry {
             idle_stack: CachePadded::new(RwLock::new(Vec::new())),
             idle_count: CachePadded::new(AtomicUsize::new(0)),
             stealers_cache: CachePadded::new(RwLock::new(Arc::new(Vec::new()))),
-            next_id: AtomicUsize::new(0),
+            next_id: AtomicUsize::new(FIRST_WORKER_ID),
         }
     }
 
-    /// Allocate a new unique worker ID.
+    /// Allocate a new unique, non-zero worker ID.
     pub fn allocate_id(&self) -> WorkerId {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -204,11 +210,12 @@ impl ExecutorCore {
 
     /// Push a task into the global injector or local worker queue and awaken an idle worker.
     pub fn inject(&self, task: TaskHandle) {
-        if crate::waker::try_single_hop_push(task.clone()) {
-            return;
+        // Single-hop: if the caller is itself a worker, keep the work on its local
+        // deque instead of bouncing it through the shared injector.
+        if let Some(task) = crate::waker::try_push_local(task) {
+            self.injector.push(task);
+            self.registry.unpark_one_idle();
         }
-        self.injector.push(task);
-        self.registry.unpark_one_idle();
     }
 
     /// Steal from the global injector.

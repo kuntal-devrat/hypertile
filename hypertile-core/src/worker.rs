@@ -6,15 +6,18 @@
 //! 3. Steal from peer workers using randomized victim selection.
 //! 4. Park with backoff and double-checking when completely idle.
 
+use crossbeam_deque::{Steal, Worker};
+use crossbeam_utils::sync::Parker;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use crossbeam_deque::{Steal, Worker};
-use crossbeam_utils::sync::Parker;
 
 use crate::executor::{ExecutorCore, WorkerEntry, WorkerId, WorkerKind};
 use crate::task::{TaskHandle, TaskKind};
-use crate::waker::{local_pop, set_local_worker, steal_injector_into_local, steal_into_local, take_local_worker};
+use crate::waker::{
+    local_pop, set_local_worker, steal_injector_into_local, steal_into_local,
+    take_any_local_worker, take_local_worker,
+};
 
 thread_local! {
     static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -44,11 +47,14 @@ fn fast_rand(worker_id: usize) -> usize {
 }
 
 /// Active execution context for a worker.
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
 pub struct WorkerHandle {
     pub id: WorkerId,
     pub kind: WorkerKind,
     pub core: Arc<ExecutorCore>,
     parker: Parker,
+    tick: AtomicUsize,
 }
 
 impl WorkerHandle {
@@ -60,8 +66,18 @@ impl WorkerHandle {
         let worker_deque = Worker::new_fifo();
         let stealer = worker_deque.stealer();
 
+        // A thread may already own a local deque (nested or repeated registration).
+        // Drain it into the shared injector *before* installing the new deque, so the
+        // queued tasks are neither dropped nor merely shifted onto this thread's new
+        // queue. `core.inject` therefore sees no local worker and uses the injector.
+        if let Some(previous) = take_any_local_worker() {
+            while let Some(task) = previous.pop() {
+                core.inject(task);
+            }
+        }
+
         // Install deque in thread-local storage for single-hop push/pop
-        set_local_worker(worker_deque);
+        set_local_worker(id, worker_deque);
 
         // Register in executor core
         core.registry().register(WorkerEntry {
@@ -81,6 +97,7 @@ impl WorkerHandle {
             kind,
             core,
             parker,
+            tick: AtomicUsize::new(0),
         };
 
         (handle, guard)
@@ -91,6 +108,15 @@ impl WorkerHandle {
     /// 2. Global injector (batch-steals half to local deque)
     /// 3. Peer stealers (batch-steals half to local deque)
     pub fn find_task(&self) -> Option<TaskHandle> {
+        let tick = self.tick.fetch_add(1, AtomicOrdering::Relaxed);
+
+        // Every 64 ticks, check the global injector first to prevent injector starvation
+        if tick % 64 == 0 {
+            if let Steal::Success(task) = steal_injector_into_local(self.core.injector()) {
+                return Some(task);
+            }
+        }
+
         // 1. Local deque
         if let Some(task) = local_pop() {
             return Some(task);
@@ -247,8 +273,9 @@ impl Drop for WorkerGuard {
         // Deregister from pool
         self.core.registry().deregister(self.id);
 
-        // Take back local worker deque and flush any orphan tasks to global injector
-        if let Some(worker) = take_local_worker() {
+        // Take back local worker deque and flush any orphan tasks to global injector.
+        // This only succeeds if this guard still owns the thread's deque.
+        if let Some(worker) = take_local_worker(self.id) {
             while let Some(task) = worker.pop() {
                 self.core.inject(task);
             }

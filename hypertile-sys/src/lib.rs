@@ -1,7 +1,9 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyListMethods, PyTuple, PyTupleMethods};
+use std::any::Any;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub mod bilingual;
 pub mod cancel;
@@ -10,12 +12,91 @@ pub mod exceptions;
 use bilingual::PyCoroutineTask;
 use cancel::PyCancellationToken;
 use exceptions::{PanicInTask, RegistrationError, TaskCancelled};
-use hypertile_core::{global_runtime, register_worker as core_register_worker, RegisteredWorker as CoreRegisteredWorker, TaskHandle, WorkerKind};
+use hypertile_core::{
+    global_runtime, register_worker as core_register_worker,
+    RegisteredWorker as CoreRegisteredWorker, TaskHandle, WorkerKind,
+};
+
+/// Render a caught Rust panic payload into a human-readable message.
+fn panic_message(payload: Box<dyn Any + Send + 'static>, fallback: &str) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        fallback.to_string()
+    }
+}
+
+/// Register a completion callback without racing task completion.
+///
+/// A naive "check done, then push" sequence loses the callback whenever the task
+/// finishes in between. Re-checking under the callback lock closes that window: the
+/// producer drains the same queue under the same lock, so the callback always runs
+/// exactly once.
+fn add_completion_callback<F>(
+    py: Python<'_>,
+    cb: Py<PyAny>,
+    callbacks: &parking_lot::Mutex<Vec<Py<PyAny>>>,
+    is_done: F,
+) -> PyResult<()>
+where
+    F: Fn() -> bool,
+{
+    let mut guard = callbacks.lock();
+    if is_done() {
+        drop(guard);
+        if let Err(e) = cb.call1(py, ()) {
+            e.print(py);
+        }
+        return Ok(());
+    }
+
+    guard.push(cb);
+
+    if is_done() {
+        let pending = std::mem::take(&mut *guard);
+        drop(guard);
+        for callback in pending {
+            if let Err(e) = callback.call1(py, ()) {
+                e.print(py);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn wrap_done_callback(py: Python<'_>, cb: Py<PyAny>, target: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let closure = pyo3::types::PyCFunction::new_closure(py, None, None, move |_args, _kwargs| {
+        Python::attach(|py| {
+            let cb_bound = cb.bind(py);
+            let target_bound = target.bind(py);
+            // Hypertile's native contract is Callable[[], Any]. Try 0-arg call first.
+            match cb_bound.call0() {
+                Ok(_) => Ok::<(), PyErr>(()),
+                Err(err) => {
+                    // If 0-arg call failed because it requires the task/future argument (standard asyncio style: cb(future)),
+                    // fallback to calling with target.
+                    if err.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
+                        let msg = err.to_string();
+                        if msg.contains("missing") && msg.contains("required positional argument") {
+                            cb_bound.call1((target_bound,))?;
+                            return Ok(());
+                        }
+                    }
+                    Err(err)
+                }
+            }
+        })
+    })?;
+    Ok(closure.into_any().unbind())
+}
 
 /// Check whether the active Python runtime has free-threading (PEP 779 / No-GIL) enabled.
 #[pyfunction]
 fn is_free_threaded(py: Python<'_>) -> bool {
-    // Check sys._is_gil_enabled() available on Python 3.13t/3.14t+
+    // Check sys._is_gil_enabled() available on free-threaded builds (3.14t+)
     let sys = match py.import("sys") {
         Ok(s) => s,
         Err(_) => return false,
@@ -59,7 +140,9 @@ impl PyRegisteredWorker {
             w.run_until_idle();
             Ok(())
         } else {
-            Err(RegistrationError::new_err("worker has already been deregistered"))
+            Err(RegistrationError::new_err(
+                "worker has already been deregistered",
+            ))
         }
     }
 
@@ -129,24 +212,30 @@ fn run_level1(py: Python<'_>, main_coro: Py<PyAny>) -> PyResult<Py<PyAny>> {
     let (tx, rx) = channel();
 
     // Done callback that sends (result, error) across channel
-    let done_fn = pyo3::types::PyCFunction::new_closure(
-        py,
-        None,
-        None,
-        move |args, _kwargs| {
-            let val = args.get_item(0)?;
-            let err = args.get_item(1)?;
-            let _ = tx.send((val.unbind(), err.unbind()));
-            Ok::<(), PyErr>(())
-        },
-    )?;
+    let done_fn = pyo3::types::PyCFunction::new_closure(py, None, None, move |args, _kwargs| {
+        let val = args.get_item(0)?;
+        let err = args.get_item(1)?;
+        let _ = tx.send((val.unbind(), err.unbind()));
+        Ok::<(), PyErr>(())
+    })?;
 
     spawn_coroutine(main_coro, Some(done_fn.into()), None)?;
 
-    // Release GIL while awaiting completion on worker pool
-    let result_pair = py.allow_threads(move || {
-        rx.recv().expect("failed to receive coroutine result")
-    });
+    // Release GIL while awaiting completion on worker pool, polling periodically for signals
+    let rx = parking_lot::Mutex::new(rx);
+    let result_pair = loop {
+        match py.detach(|| rx.lock().recv_timeout(std::time::Duration::from_millis(50))) {
+            Ok(pair) => break pair,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                py.check_signals()?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "coroutine channel disconnected before completion",
+                ));
+            }
+        }
+    };
 
     let (val, err) = result_pair;
     if !err.is_none(py) {
@@ -182,7 +271,7 @@ pub fn run_crypto_pipeline(data: &[u8], rounds: usize) -> Vec<u8> {
 #[pyo3(signature = (payload, rounds = 100))]
 fn native_pipeline_transform(py: Python<'_>, payload: &[u8], rounds: usize) -> Vec<u8> {
     let data = payload.to_vec();
-    py.allow_threads(move || run_crypto_pipeline(&data, rounds))
+    py.detach(move || run_crypto_pipeline(&data, rounds))
 }
 
 fn bridge_task_await<'py, T: 'static>(slf: &Bound<'py, T>) -> PyResult<Py<PyAny>> {
@@ -194,12 +283,9 @@ fn bridge_task_await<'py, T: 'static>(slf: &Bound<'py, T>) -> PyResult<Py<PyAny>
             let loop_clone = loop_obj.clone().unbind();
             let slf_any = slf.clone().into_any().unbind();
 
-            let cb = pyo3::types::PyCFunction::new_closure(
-                py,
-                None,
-                None,
-                move |_args, _kwargs| {
-                    Python::with_gil(|py| {
+            let cb =
+                pyo3::types::PyCFunction::new_closure(py, None, None, move |_args, _kwargs| {
+                    Python::attach(|py| {
                         let loop_bound = loop_clone.bind(py);
                         let fut_bound = fut_clone.bind(py);
                         if let Ok(cancelled) = fut_bound.call_method0("cancelled") {
@@ -224,8 +310,7 @@ fn bridge_task_await<'py, T: 'static>(slf: &Bound<'py, T>) -> PyResult<Py<PyAny>
                         }
                         Ok::<(), PyErr>(())
                     })
-                },
-            )?;
+                })?;
 
             slf.as_any().call_method1("add_done_callback", (cb,))?;
             let await_iter = fut.call_method0("__await__")?;
@@ -242,7 +327,7 @@ struct NativeTaskInner {
 }
 
 /// An awaitable native task handle driven directly by Hypertile's work-stealing pool.
-#[pyclass(name = "NativeTask")]
+#[pyclass(name = "NativeTask", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyNativeTask {
     inner: Arc<NativeTaskInner>,
@@ -259,19 +344,18 @@ impl PyNativeTask {
         match res.as_ref() {
             Some(Ok(v)) => Ok(pyo3::types::PyBytes::new(py, v).into_any().unbind()),
             Some(Err(msg)) => Err(PanicInTask::new_err(msg.clone())),
-            None => Err(pyo3::exceptions::PyRuntimeError::new_err("task not completed")),
+            None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "task not completed",
+            )),
         }
     }
 
-    pub fn add_done_callback(&self, py: Python<'_>, cb: Py<PyAny>) -> PyResult<()> {
-        let mut cb_guard = self.inner.callbacks.lock();
-        if self.inner.done.load(std::sync::atomic::Ordering::Acquire) {
-            drop(cb_guard);
-            let _ = cb.call1(py, ());
-        } else {
-            cb_guard.push(cb);
-        }
-        Ok(())
+    pub fn add_done_callback(slf: Bound<'_, Self>, cb: Py<PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        let wrapped = wrap_done_callback(py, cb, slf.clone().into_any().unbind())?;
+        add_completion_callback(py, wrapped, &slf.borrow().inner.callbacks, || {
+            slf.borrow().inner.done.load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     fn __await__(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -321,26 +405,24 @@ fn spawn_native_pipeline(payload: &[u8], rounds: usize) -> PyNativeTask {
                 *inner_clone.result.lock() = Some(Ok(output));
             }
             Err(panic_payload) => {
-                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "native task panicked during execution".to_string()
-                };
+                let msg = panic_message(panic_payload, "native task panicked during execution");
                 *inner_clone.result.lock() = Some(Err(msg));
             }
         }
-        inner_clone.done.store(true, std::sync::atomic::Ordering::Release);
+        inner_clone
+            .done
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let callbacks = {
             let mut cb_guard = inner_clone.callbacks.lock();
             std::mem::take(&mut *cb_guard)
         };
         if !callbacks.is_empty() {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 for cb in callbacks {
-                    let _ = cb.call1(py, ());
+                    if let Err(e) = cb.call1(py, ()) {
+                        e.print(py);
+                    }
                 }
             });
         }
@@ -357,7 +439,7 @@ struct BatchNativeInner {
 }
 
 /// An awaitable batch of native tasks executed in parallel across Hypertile workers.
-#[pyclass(name = "BatchNativeTask")]
+#[pyclass(name = "BatchNativeTask", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyBatchNativeTask {
     inner: Arc<BatchNativeInner>,
@@ -366,12 +448,17 @@ pub struct PyBatchNativeTask {
 #[pymethods]
 impl PyBatchNativeTask {
     pub fn done(&self) -> bool {
-        self.inner.remaining.load(std::sync::atomic::Ordering::Acquire) == 0
+        self.inner
+            .remaining
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
     }
 
     pub fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if !self.done() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err("batch task not completed"));
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "batch task not completed",
+            ));
         }
         if let Some(err_msg) = self.inner.panic_error.lock().as_ref() {
             return Err(PanicInTask::new_err(err_msg.clone()));
@@ -388,15 +475,16 @@ impl PyBatchNativeTask {
         Ok(py_list.into_any().unbind())
     }
 
-    pub fn add_done_callback(&self, py: Python<'_>, cb: Py<PyAny>) -> PyResult<()> {
-        let mut cb_guard = self.inner.callbacks.lock();
-        if self.done() {
-            drop(cb_guard);
-            let _ = cb.call1(py, ());
-        } else {
-            cb_guard.push(cb);
-        }
-        Ok(())
+    pub fn add_done_callback(slf: Bound<'_, Self>, cb: Py<PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        let wrapped = wrap_done_callback(py, cb, slf.clone().into_any().unbind())?;
+        add_completion_callback(py, wrapped, &slf.borrow().inner.callbacks, || {
+            slf.borrow()
+                .inner
+                .remaining
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+        })
     }
 
     fn __await__(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -473,26 +561,26 @@ fn batch_spawn_native_pipeline(payloads: Vec<Vec<u8>>, rounds: usize) -> PyBatch
                     }
                 }
                 Err(payload) => {
-                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "batch chunk panicked".to_string()
-                    };
+                    let msg = panic_message(payload, "batch chunk panicked");
                     *inner_clone.panic_error.lock() = Some(msg);
                 }
             }
 
-            if inner_clone.remaining.fetch_sub(count, std::sync::atomic::Ordering::AcqRel) == count {
+            if inner_clone
+                .remaining
+                .fetch_sub(count, std::sync::atomic::Ordering::AcqRel)
+                == count
+            {
                 let callbacks = {
                     let mut cb_guard = inner_clone.callbacks.lock();
                     std::mem::take(&mut *cb_guard)
                 };
                 if !callbacks.is_empty() {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         for cb in callbacks {
-                            let _ = cb.call1(py, ());
+                            if let Err(e) = cb.call1(py, ()) {
+                                e.print(py);
+                            }
                         }
                     });
                 }
@@ -510,7 +598,7 @@ struct CallableTaskInner {
 }
 
 /// An awaitable generic Python callable task executed on Hypertile's work-stealing pool.
-#[pyclass(name = "CallableTask")]
+#[pyclass(name = "CallableTask", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyCallableTask {
     inner: Arc<CallableTaskInner>,
@@ -527,19 +615,18 @@ impl PyCallableTask {
         match res.as_ref() {
             Some(Ok(v)) => Ok(v.clone_ref(py)),
             Some(Err(e)) => Err(e.clone_ref(py)),
-            None => Err(pyo3::exceptions::PyRuntimeError::new_err("task not completed")),
+            None => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "task not completed",
+            )),
         }
     }
 
-    pub fn add_done_callback(&self, py: Python<'_>, cb: Py<PyAny>) -> PyResult<()> {
-        let mut cb_guard = self.inner.callbacks.lock();
-        if self.inner.done.load(std::sync::atomic::Ordering::Acquire) {
-            drop(cb_guard);
-            let _ = cb.call1(py, ());
-        } else {
-            cb_guard.push(cb);
-        }
-        Ok(())
+    pub fn add_done_callback(slf: Bound<'_, Self>, cb: Py<PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        let wrapped = wrap_done_callback(py, cb, slf.clone().into_any().unbind())?;
+        add_completion_callback(py, wrapped, &slf.borrow().inner.callbacks, || {
+            slf.borrow().inner.done.load(std::sync::atomic::Ordering::Acquire)
+        })
     }
 
     fn __await__(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -583,7 +670,7 @@ fn spawn_callable(
 
     let rt = global_runtime();
     rt.spawn(async move {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match (args.as_ref(), kwargs.as_ref()) {
                     (Some(a), Some(kw)) => func.bind(py).call(a.bind(py), Some(kw.bind(py))),
@@ -596,27 +683,25 @@ fn spawn_callable(
             let stored_res = match panic_res {
                 Ok(Ok(val)) => Ok(val.unbind()),
                 Ok(Err(err)) => Err(err),
-                Err(panic_payload) => {
-                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "callable task panicked".to_string()
-                    };
-                    Err(PanicInTask::new_err(msg))
-                }
+                Err(panic_payload) => Err(PanicInTask::new_err(panic_message(
+                    panic_payload,
+                    "callable task panicked",
+                ))),
             };
 
             *inner_clone.result.lock() = Some(stored_res);
-            inner_clone.done.store(true, std::sync::atomic::Ordering::Release);
+            inner_clone
+                .done
+                .store(true, std::sync::atomic::Ordering::Release);
 
             let callbacks = {
                 let mut cb_guard = inner_clone.callbacks.lock();
                 std::mem::take(&mut *cb_guard)
             };
             for cb in callbacks {
-                let _ = cb.call1(py, ());
+                if let Err(e) = cb.call1(py, ()) {
+                    e.print(py);
+                }
             }
         });
     });
@@ -628,10 +713,11 @@ struct BatchCallableInner {
     results: parking_lot::Mutex<Vec<Option<PyResult<Py<PyAny>>>>>,
     remaining: std::sync::atomic::AtomicUsize,
     callbacks: parking_lot::Mutex<Vec<Py<PyAny>>>,
+    panic_error: parking_lot::Mutex<Option<String>>,
 }
 
 /// An awaitable batch of Python callables executed in parallel across Hypertile workers.
-#[pyclass(name = "BatchCallableTask")]
+#[pyclass(name = "BatchCallableTask", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyBatchCallableTask {
     inner: Arc<BatchCallableInner>,
@@ -640,12 +726,20 @@ pub struct PyBatchCallableTask {
 #[pymethods]
 impl PyBatchCallableTask {
     pub fn done(&self) -> bool {
-        self.inner.remaining.load(std::sync::atomic::Ordering::Acquire) == 0
+        self.inner
+            .remaining
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
     }
 
     pub fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if !self.done() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err("batch callable task not completed"));
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "batch callable task not completed",
+            ));
+        }
+        if let Some(err_msg) = self.inner.panic_error.lock().as_ref() {
+            return Err(PanicInTask::new_err(err_msg.clone()));
         }
         let guard = self.inner.results.lock();
         let py_list = pyo3::types::PyList::empty(py);
@@ -659,15 +753,16 @@ impl PyBatchCallableTask {
         Ok(py_list.into_any().unbind())
     }
 
-    pub fn add_done_callback(&self, py: Python<'_>, cb: Py<PyAny>) -> PyResult<()> {
-        let mut cb_guard = self.inner.callbacks.lock();
-        if self.done() {
-            drop(cb_guard);
-            let _ = cb.call1(py, ());
-        } else {
-            cb_guard.push(cb);
-        }
-        Ok(())
+    pub fn add_done_callback(slf: Bound<'_, Self>, cb: Py<PyAny>) -> PyResult<()> {
+        let py = slf.py();
+        let wrapped = wrap_done_callback(py, cb, slf.clone().into_any().unbind())?;
+        add_completion_callback(py, wrapped, &slf.borrow().inner.callbacks, || {
+            slf.borrow()
+                .inner
+                .remaining
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+        })
     }
 
     fn __await__(slf: Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -708,6 +803,7 @@ fn batch_spawn_callable(
         results: parking_lot::Mutex::new(initial_results),
         remaining: std::sync::atomic::AtomicUsize::new(total),
         callbacks: parking_lot::Mutex::new(Vec::new()),
+        panic_error: parking_lot::Mutex::new(None),
     });
 
     if total == 0 {
@@ -732,31 +828,50 @@ fn batch_spawn_callable(
         let func_clone = func.clone_ref(py);
         let args_ref = args_arc.clone();
 
+        let count = end - start;
+
         rt.spawn(async move {
-            Python::with_gil(|py| {
-                let mut chunk_res = Vec::with_capacity(end - start);
-                for i in start..end {
-                    let call_res = func_clone.bind(py).call1(args_ref[i].bind(py));
-                    let stored_res = match call_res {
-                        Ok(val) => Ok(val.unbind()),
-                        Err(err) => Err(err),
-                    };
-                    chunk_res.push(stored_res);
-                }
-                let count = chunk_res.len();
-                {
-                    let mut guard = inner_clone.results.lock();
-                    for (offset, res) in chunk_res.into_iter().enumerate() {
-                        guard[start + offset] = Some(res);
+            Python::attach(|py| {
+                // Panic containment is mandatory here: if a chunk dies without
+                // decrementing `remaining`, every awaiter hangs forever.
+                let chunk_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut results = Vec::with_capacity(count);
+                    for i in start..end {
+                        let stored_res = match func_clone.bind(py).call1(args_ref[i].bind(py)) {
+                            Ok(val) => Ok(val.unbind()),
+                            Err(err) => Err(err),
+                        };
+                        results.push(stored_res);
+                    }
+                    results
+                }));
+
+                match chunk_res {
+                    Ok(chunk_res) => {
+                        let mut guard = inner_clone.results.lock();
+                        for (offset, res) in chunk_res.into_iter().enumerate() {
+                            guard[start + offset] = Some(res);
+                        }
+                    }
+                    Err(payload) => {
+                        let msg = panic_message(payload, "batch callable chunk panicked");
+                        *inner_clone.panic_error.lock() = Some(msg);
                     }
                 }
-                if inner_clone.remaining.fetch_sub(count, std::sync::atomic::Ordering::AcqRel) == count {
+
+                if inner_clone
+                    .remaining
+                    .fetch_sub(count, std::sync::atomic::Ordering::AcqRel)
+                    == count
+                {
                     let callbacks = {
                         let mut cb_guard = inner_clone.callbacks.lock();
                         std::mem::take(&mut *cb_guard)
                     };
                     for cb in callbacks {
-                        let _ = cb.call1(py, ());
+                        if let Err(e) = cb.call1(py, ()) {
+                            e.print(py);
+                        }
                     }
                 }
             });
@@ -764,6 +879,47 @@ fn batch_spawn_callable(
     }
 
     PyBatchCallableTask { inner }
+}
+
+/// Stop Hypertile's background workers before the interpreter shuts down.
+///
+/// Registered as an `atexit` hook by the `hypertile` package. Deliberately does not
+/// join worker threads, because a worker blocked on the interpreter lock cannot exit
+/// while the caller holds it; instead it flips the stop flag and waits briefly for
+/// workers to observe it, so they cannot touch the interpreter mid-finalization.
+#[pyfunction]
+fn shutdown(py: Python<'_>) -> PyResult<()> {
+    py.detach(|| {
+        hypertile_core::shutdown_with_timeout(Duration::from_millis(500));
+    });
+    Ok(())
+}
+
+/// Set the size of Hypertile's shared worker pool.
+///
+/// `workers = 0` selects the automatic count (one worker per logical CPU plus a small
+/// blocking headroom). The pool is process-wide and its size is fixed once it starts,
+/// so this must run before any Hypertile operation; otherwise a `RuntimeError` reports
+/// the size that is actually running, and `HYPERTILE_WORKERS` is the way to configure a
+/// pool that something else started first.
+#[pyfunction]
+#[pyo3(signature = (workers = 0))]
+fn configure(workers: usize) -> PyResult<usize> {
+    hypertile_core::configure_global_runtime(workers)
+        .map(|runtime| runtime.num_workers())
+        .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))
+}
+
+/// Number of workers in the shared pool, or `None` if the pool has not started.
+#[pyfunction]
+fn worker_count() -> Option<usize> {
+    hypertile_core::global_runtime_if_init().map(|runtime| runtime.num_workers())
+}
+
+/// The worker count that `configure(0)` would choose on this machine.
+#[pyfunction]
+fn default_worker_count() -> usize {
+    hypertile_core::default_worker_count()
 }
 
 /// Python extension module definition.
@@ -787,5 +943,10 @@ fn _hypertile_sys(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_spawn_native_pipeline, m)?)?;
     m.add_function(wrap_pyfunction!(spawn_callable, m)?)?;
     m.add_function(wrap_pyfunction!(batch_spawn_callable, m)?)?;
+    m.add_function(wrap_pyfunction!(configure, m)?)?;
+    m.add_function(wrap_pyfunction!(worker_count, m)?)?;
+    m.add_function(wrap_pyfunction!(default_worker_count, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown, m)?)?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

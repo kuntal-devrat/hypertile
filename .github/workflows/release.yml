@@ -17,7 +17,7 @@ permissions:
   id-token: write
 
 env:
-  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+  CARGO_TERM_COLOR: always
 
 jobs:
   linux:
@@ -33,12 +33,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: PyO3/maturin-action@v1
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           target: ${{ matrix.target }}
           manylinux: auto
-          args: --release --out dist -i python3.11 -i python3.12 -i python3.13
+          args: --release --out dist -i python3.11 -i python3.12 -i python3.13 -i python3.14 -i python3.14t
       - name: Upload Wheels
         uses: actions/upload-artifact@v4
         with:
@@ -58,8 +56,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: PyO3/maturin-action@v1
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
@@ -82,8 +78,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: PyO3/maturin-action@v1
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
@@ -99,8 +93,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           command: sdist
           args: --out dist

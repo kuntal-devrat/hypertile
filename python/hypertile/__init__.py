@@ -10,8 +10,10 @@ Key Interfaces:
 """
 
 # pyright: reportAssignmentType=false
+import atexit
 import functools
 import inspect
+import os
 import sys
 from collections.abc import Callable, Coroutine, Iterable, Sequence
 from typing import Any, TypeVar
@@ -29,10 +31,19 @@ try:
         TaskCancelled,
     )
     from ._hypertile_sys import (
+        __version__ as _native_version,
+    )
+    from ._hypertile_sys import (
         batch_spawn_callable as _batch_spawn_callable,
     )
     from ._hypertile_sys import (
         batch_spawn_native_pipeline as _batch_spawn_native_pipeline,
+    )
+    from ._hypertile_sys import (
+        configure as _configure,
+    )
+    from ._hypertile_sys import (
+        default_worker_count as _default_worker_count,
     )
     from ._hypertile_sys import (
         is_free_threaded as _is_free_threaded,
@@ -55,8 +66,16 @@ try:
     from ._hypertile_sys import (
         spawn_native_pipeline as _spawn_native_pipeline,
     )
+    from ._hypertile_sys import (
+        worker_count as _worker_count,
+    )
+
+    _NATIVE_EXTENSION_AVAILABLE = True
 except ImportError:
     # Graceful fallback if native extension is not yet built
+    _NATIVE_EXTENSION_AVAILABLE = False
+    _native_version = None
+
     def _is_free_threaded() -> bool:
         return not getattr(sys, "_is_gil_enabled", lambda: True)()
 
@@ -83,6 +102,19 @@ except ImportError:
 
     def _run_level1(coro):
         raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+
+    def _configure(workers: int = 0) -> int:
+        raise NotImplementedError("Native extension _hypertile_sys is not installed.")
+
+    def _worker_count() -> int | None:
+        return None
+
+    def _default_worker_count() -> int:
+        # Mirrors the Rust policy (one worker per logical CPU plus blocking headroom,
+        # capped) so a source-only checkout still answers the question. Without the
+        # extension there is no pool, so nothing can depend on the number.
+        cores = max(1, os.cpu_count() or 1)
+        return max(cores, min(32, cores + 4))
 
     class CancellationToken:
         def __init__(self):
@@ -121,7 +153,9 @@ except ImportError:
 
 from .asyncio_policy import install
 
-__version__ = "0.1.1"
+# Version metadata is owned by the Rust crates once the extension is built; the literal
+# is only a fallback for source-only checkouts.
+__version__ = _native_version or "0.1.2"
 __all__ = [
     "BatchCallableTask",
     "BatchNativeTask",
@@ -133,6 +167,8 @@ __all__ = [
     "RegistrationError",
     "TaskCancelled",
     "batch_native_pipeline",
+    "configure",
+    "default_worker_count",
     "gather_to_thread",
     "install",
     "is_free_threaded",
@@ -143,6 +179,7 @@ __all__ = [
     "spawn_native_pipeline",
     "task",
     "to_thread",
+    "worker_count",
 ]
 
 _T = TypeVar("_T")
@@ -166,7 +203,10 @@ def to_thread(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Any:
     Example:
         result = await hypertile.to_thread(crypto_hash, payload, rounds=50)
     """
-    if inspect.iscoroutinefunction(func):
+    check_func = func
+    while isinstance(check_func, functools.partial):
+        check_func = check_func.func
+    if inspect.iscoroutinefunction(check_func):
         raise TypeError(
             "hypertile.to_thread() does not accept coroutines; use await func() directly."
         )
@@ -267,9 +307,7 @@ def gather_to_thread(func: Callable[..., _T], args_iterable: Iterable[Any]) -> A
         import asyncio
 
         async def _fallback_gather():
-            return await asyncio.gather(
-                *(asyncio.to_thread(func, *a) for a in norm_args)
-            )
+            return await asyncio.gather(*(asyncio.to_thread(func, *a) for a in norm_args))
 
         return _fallback_gather()
 
@@ -282,6 +320,50 @@ def native_pipeline_transform(payload: bytes, rounds: int = 100) -> bytes:
 def is_free_threaded() -> bool:
     """Return True if the running Python interpreter has free-threading (PEP 779) enabled."""
     return _is_free_threaded()
+
+
+def configure(workers: int | None = None) -> int:
+    """Set the number of threads in Hypertile's shared worker pool.
+
+    The pool is process-wide, and its size is fixed once it has been used, so call this
+    before the first Hypertile operation. If the pool is already running a
+    ``RuntimeError`` is raised naming the size that is actually in use, rather than
+    silently ignoring the request. To size a pool that is started by code running before
+    yours (a framework or library that offloads work at import time), set the
+    ``HYPERTILE_WORKERS`` environment variable instead.
+
+    Args:
+        workers: Number of worker threads. ``None`` (or ``0``) selects the default:
+            one worker per logical CPU plus a small headroom for blocking calls, so
+            synchronous drivers and file I/O can overlap instead of queueing. Use a
+            larger value for I/O-heavy services and the CPU count for compute-bound
+            ones.
+
+    Returns:
+        The effective pool size, which equals ``workers`` unless ``None``/``0`` was
+        passed.
+
+    Example:
+        import hypertile
+
+        hypertile.configure(workers=32)  # I/O-bound service
+        assert hypertile.worker_count() == 32
+    """
+    return _configure(0 if workers is None else workers)
+
+
+def worker_count() -> int | None:
+    """Number of threads in the shared pool, or ``None`` if it has not started yet."""
+    return _worker_count()
+
+
+def default_worker_count() -> int:
+    """The pool size ``configure()`` would choose on this machine if not told otherwise.
+
+    Inspectable so the default is not a mystery, and so tests can assert the policy
+    without starting a pool they cannot resize.
+    """
+    return _default_worker_count()
 
 
 def register_worker(kind: str = "bilingual") -> RegisteredWorker:
@@ -299,7 +381,7 @@ def run(main_coroutine: Coroutine, *, level1: bool = False) -> Any:
 
     By default, installs Hypertile's work-stealing executor into asyncio and executes
     via ``asyncio.run(main_coroutine)``, ensuring 100% compatibility with asyncio primitives
-    (e.g. ``asyncio.sleep``, ``httpx``, ``aiohttp``) across all Python versions including 3.13t.
+    (e.g. ``asyncio.sleep``, ``httpx``, ``aiohttp``) across all supported Python versions, including free-threaded 3.14t.
 
     If ``level1=True`` is specified, drives coroutines directly across bilingual native
     workers without initializing an asyncio event loop.
@@ -311,3 +393,27 @@ def run(main_coroutine: Coroutine, *, level1: bool = False) -> Any:
 
     install()
     return asyncio.run(main_coroutine)
+
+
+def _shutdown_background_workers() -> None:
+    """Stop Hypertile's background workers before the interpreter is finalized.
+
+    Registered as an ``atexit`` hook: a worker thread that touches a half torn-down
+    interpreter crashes the process. The native side flips its stop flag and waits
+    briefly for workers to observe it; it deliberately never joins them, because a
+    worker blocked on the GIL cannot exit while ``atexit`` holds it.
+
+    Safe to call more than once.
+    """
+    if not _NATIVE_EXTENSION_AVAILABLE:
+        return
+    try:
+        from . import _hypertile_sys
+
+        _hypertile_sys.shutdown()
+    except Exception:  # noqa: BLE001 - best effort during interpreter exit
+        pass
+
+
+if _NATIVE_EXTENSION_AVAILABLE:
+    atexit.register(_shutdown_background_workers)

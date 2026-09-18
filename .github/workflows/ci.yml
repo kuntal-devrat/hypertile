@@ -11,12 +11,71 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+  CARGO_TERM_COLOR: always
 
 jobs:
+  lint-rust:
+    name: Rust lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  lint-python:
+    name: Python lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: python -m pip install --upgrade pip ruff
+      - name: Ruff check
+        run: ruff check .
+
+  typecheck-python:
+    name: Python type check (pyright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # pyrightconfig.json points at `.venv`, so create it and install the test
+      # dependency the suite imports, otherwise import resolution fails.
+      - name: Create type-resolution venv
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip pytest
+      - name: Install pyright
+        # Pinned so an upstream pyright release cannot break the gate on its own.
+        run: python -m pip install "pyright==1.1.413"
+      - name: Pyright
+        run: pyright
+
   test-rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # The randomized scenarios in `tests/race_harness.rs` derive their schedules from
+      # this seed. Pinning it keeps the per-PR gate deterministic and reproducible; broad
+      # seed exploration is the scheduled `Sanitizers / race-stress` workflow's job, and
+      # `scripts/race_stress.sh` does the same locally. When a sweep does find a bad
+      # schedule, add it to the harness as a named regression test rather than changing
+      # this seed.
+      HYPERTILE_RACE_SEED: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -33,9 +92,11 @@ jobs:
           workspaces: |
             . -> target
       - name: Cargo Check
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
+      # hypertile-sys is a cdylib that needs an interpreter to link, so its behaviour
+      # is covered by the Python job instead. The C ABI crate has its own tests.
       - name: Cargo Test
-        run: cargo test -p hypertile-core -- --nocapture
+        run: cargo test -p hypertile-core -p hypertile-capi --locked -- --nocapture
 
   test-python:
     name: Python ${{ matrix.python-version }} (${{ matrix.os }})
@@ -44,18 +105,31 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.11", "3.12", "3.13"]
+        # 3.14t is the free-threaded build (PEP 779) - the configuration this project
+        # exists to accelerate, so it must never regress unobserved.
+        #
+        # 3.13t is deliberately absent: PyO3 dropped free-threaded 3.13 support in the
+        # same release that added 3.14, so no PyO3 version supports both. 3.14t is the
+        # CPython release that declared free-threading supported, so it wins.
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.14t"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          pip install maturin pytest
+          pip install "maturin>=1.8,<2.0" pytest
       - name: Build & Install Hypertile
         run: pip install .
+      - name: Report interpreter mode
+        run: python -c "import hypertile; print('version:', hypertile.__version__, '| free-threaded:', hypertile.is_free_threaded())"
       - name: Run Pytest
         run: pytest -v tests/

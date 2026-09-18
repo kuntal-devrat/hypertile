@@ -11,11 +11,14 @@
 //! - Panic containment: panics in spawned tasks are caught via `catch_unwind` and routed
 //!   to [`JoinHandle`] as [`JoinError::Panicked`].
 //! - Self-contained timer wheel for asynchronous sleeps without Tokio.
+//!
+//! The global pool's size can be configured before it starts, via
+//! [`configure_global_runtime`] or the [`WORKERS_ENV`] environment variable; see
+//! [`default_worker_count`] for how the default is chosen.
 
 pub mod executor;
 pub mod registration;
 pub mod runtime;
-pub mod slab;
 pub mod task;
 pub mod timer;
 pub mod waker;
@@ -23,9 +26,14 @@ pub mod worker;
 
 pub use executor::{ExecutorCore, WorkerEntry, WorkerId, WorkerKind, WorkerRegistry};
 pub use registration::{register_worker, RegisteredWorker};
-pub use runtime::{block_on, global_runtime, shutdown, spawn, spawn_local, Runtime};
-pub use slab::ObjectPool;
-pub use task::{JoinError, JoinHandle, RawTask, Runnable, TaskCell, TaskHandle, TaskKind, TaskScheduler};
+pub use runtime::{
+    block_on, configure_global_runtime, default_worker_count, global_runtime,
+    global_runtime_if_init, init_global_runtime, shutdown, shutdown_with_timeout, spawn,
+    spawn_local, Runtime, RuntimeAlreadyStarted, WORKERS_ENV,
+};
+pub use task::{
+    JoinError, JoinHandle, RawTask, Runnable, TaskCell, TaskHandle, TaskKind, TaskScheduler,
+};
 pub use timer::{sleep, Sleep};
 pub use worker::{start_workers, WorkerGuard, WorkerHandle};
 

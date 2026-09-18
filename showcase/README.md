@@ -15,12 +15,15 @@ Workloads simulate production CPU-intensive and cryptographic transforms (e.g. J
 
 ---
 
-## 2. Scenario 1: Free-Threaded Python 3.13t (No-GIL, PEP 779)
+## 2. Scenario 1: Free-Threaded Python (No-GIL, PEP 779)
 
-Run with `uv`:
 ```bash
-.venv-313t/Scripts/python showcase/free_threaded_showcase.py
+python showcase/free_threaded_showcase.py
 ```
+
+> The numbers below were recorded on Python 3.13t. Hypertile no longer builds for 3.13t
+> (PyO3 dropped free-threaded 3.13 in the same release that added 3.14), so re-run the
+> script on **3.14t** for current figures.
 
 ### Modes Evaluated:
 * **Mode A: Standard ThreadPoolExecutor (Double-Hop Offload):**
@@ -45,9 +48,8 @@ Run with `uv`:
 
 ## 3. Scenario 2: Standard Python 3.11 with GIL (Cooperative Mode)
 
-Run with `uv`:
 ```bash
-.venv/Scripts/python showcase/showcase_benchmark.py
+python showcase/showcase_benchmark.py
 ```
 
 ### Empirical Results (Windows AMD64, Python 3.11.9):
@@ -68,17 +70,19 @@ Run with `uv`:
 ## 4. Multi-Environment Setup with `uv`
 
 ```bash
-# 1. Install free-threaded Python 3.13t
-uv python install 3.13t
+# 1. Install free-threaded Python 3.14t
+uv python install 3.14t
 
-# 2. Setup 3.13t virtual environment
-uv venv --python 3.13t .venv-313t
-uv pip install maturin pytest fastapi httpx --python .venv-313t/Scripts/python.exe
+# 2. Setup a 3.14t virtual environment
+uv venv --python 3.14t .venv-314t
+uv pip install "maturin>=1.8,<2.0" pytest fastapi httpx --python .venv-314t/bin/python
 
-# 3. Build release extension with uv
-$env:VIRTUAL_ENV = "d:\HyperTile\.venv-313t"
-& .venv-313t\Scripts\maturin.exe develop --release --uv
+# 3. Build the release extension in place
+VIRTUAL_ENV="$PWD/.venv-314t" maturin develop --release
 
 # 4. Run the benchmark
-& .venv-313t\Scripts\python.exe showcase/free_threaded_showcase.py
+.venv-314t/bin/python showcase/free_threaded_showcase.py
 ```
+
+On Windows, replace `bin/python` with `Scripts\\python.exe` and set the environment
+variable in PowerShell (`$env:VIRTUAL_ENV = "$PWD\.venv-314t"`).

@@ -27,7 +27,7 @@ fn test_capi_init_and_version() {
 
         let ver = hypertile_version();
         let c_str = CStr::from_ptr(ver);
-        assert_eq!(c_str.to_str().unwrap(), "0.1.1");
+        assert_eq!(c_str.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
     }
 }
 
@@ -169,5 +169,66 @@ fn test_capi_worker_registration() {
 
         let dereg_res = hypertile_worker_deregister();
         assert_eq!(dereg_res, HypertileStatus::Ok as i32);
+    }
+}
+
+#[test]
+fn test_capi_concurrent_waiters() {
+    unsafe {
+        let _ = hypertile_init(4);
+
+        unsafe extern "C-unwind" fn delayed_value(arg: *mut c_void) -> *mut c_void {
+            std::thread::sleep(Duration::from_millis(40));
+            arg
+        }
+
+        let task = hypertile_spawn(Some(delayed_value), 77 as *mut c_void);
+        assert!(!task.is_null());
+
+        let task_addr = task as usize;
+        let mut threads = Vec::new();
+
+        for _ in 0..4 {
+            let t = std::thread::spawn(move || {
+                let t_ptr = task_addr as *mut HypertileTask;
+                let mut res: *mut c_void = std::ptr::null_mut();
+                let status = hypertile_wait(t_ptr, &mut res);
+                assert_eq!(status, HypertileStatus::Ok as i32);
+                assert_eq!(res as usize, 77);
+            });
+            threads.push(t);
+        }
+
+        for t in threads {
+            t.join().expect("waiter thread panicked");
+        }
+
+        hypertile_task_destroy(task);
+    }
+}
+
+#[test]
+fn test_capi_batch_spawn_panic() {
+    unsafe {
+        let _ = hypertile_init(2);
+
+        unsafe extern "C-unwind" fn maybe_panic(arg: *mut c_void) -> *mut c_void {
+            let val = arg as usize;
+            if val == 3 {
+                panic!("intentional panic on item 3");
+            }
+            (val * 10) as *mut c_void
+        }
+
+        let args: Vec<*mut c_void> = (0..8).map(|i| i as *mut c_void).collect();
+        let mut results: Vec<*mut c_void> = vec![std::ptr::null_mut(); 8];
+
+        let status = hypertile_batch_spawn(
+            Some(maybe_panic),
+            args.as_ptr(),
+            results.as_mut_ptr(),
+            8,
+        );
+        assert_eq!(status, HypertileStatus::ErrPanic as i32);
     }
 }

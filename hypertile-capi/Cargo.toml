@@ -1,15 +1,18 @@
 [package]
 name = "hypertile-capi"
-version = "0.1.1"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 description = "Lightweight extern C ABI for the Hypertile work-stealing runtime"
-license = "MIT OR Apache-2.0"
 
 [lib]
 name = "hypertile_capi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-hypertile-core = { path = "../hypertile-core" }
+hypertile-core = { version = "0.1.2", path = "../hypertile-core" }
 parking_lot = "0.12"
 crossbeam-utils = "0.8"

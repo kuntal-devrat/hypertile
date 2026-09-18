@@ -65,8 +65,15 @@ typedef void (*hypertile_callback_fn)(void* result, void* user_data);
 /**
  * @brief Initialize Hypertile's global work-stealing runtime.
  *
- * @param num_workers Number of native worker threads to spawn. Pass 0 to default
- *                    to the number of logical CPU cores.
+ * The pool is process-wide and its size is fixed once it has been used, so decide
+ * the size before submitting any work. This function is lenient: only the first call
+ * configures anything, and later calls return the already-running runtime unchanged.
+ *
+ * @param num_workers Number of native worker threads to spawn. Pass 0 to use the
+ *                    default, which is the logical CPU count plus a small headroom so
+ *                    blocking calls can overlap, capped at 32 and never below one
+ *                    worker per CPU. The `HYPERTILE_WORKERS` environment variable
+ *                    overrides the default when set to a positive integer.
  * @return HYPERTILE_OK (0) on success, or an error status code.
  */
 int32_t hypertile_init(size_t num_workers);

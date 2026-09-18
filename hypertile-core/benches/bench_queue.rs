@@ -1,5 +1,5 @@
-use std::time::Instant;
 use hypertile_core::{block_on, Runtime};
+use std::time::Instant;
 
 /// Benchmark: spawn a pool of N workers, execute M tasks to completion,
 /// and measure throughput and latency.

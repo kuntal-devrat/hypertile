@@ -1,12 +1,12 @@
 //! Cooperative cancellation token shared across Python and Rust.
 
+use pyo3::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use pyo3::prelude::*;
 
 use crate::exceptions::TaskCancelled;
 
-#[pyclass(name = "CancellationToken", weakref)]
+#[pyclass(name = "CancellationToken", weakref, from_py_object)]
 #[derive(Clone)]
 pub struct PyCancellationToken {
     inner: Arc<AtomicBool>,

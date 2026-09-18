@@ -1,0 +1,86 @@
+name: Bug report
+description: Report a crash, hang, wrong result, or build failure
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Concurrency bugs are much easier to fix with the exact
+        environment and a minimal reproduction. Please also see
+        [SECURITY.md](https://github.com/kuntal-devrat/hypertile/blob/main/SECURITY.md)
+        for anything security-sensitive.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The smallest snippet that shows the problem. Self-contained beats big.
+      render: python
+    validations:
+      required: true
+
+  - type: input
+    id: hypertile-version
+    attributes:
+      label: Hypertile version
+      description: Output of `python -c "import hypertile; print(hypertile.__version__)"`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installed-from
+    attributes:
+      label: How was it installed?
+      options:
+        - Wheel from PyPI
+        - Built from source (maturin develop)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version and build
+      description: Output of `python -VV`, e.g. "3.13.15 experimental free-threading build"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: e.g. Ubuntu 24.04 x86_64, macOS 15 arm64, Windows 11 AMD64
+    validations:
+      required: true
+
+  - type: input
+    id: cpu-count
+    attributes:
+      label: CPU count
+      description: Output of `python -c "import os; print(os.cpu_count())"` — worker counts matter for scheduling bugs.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Traceback or logs
+      description: Full traceback, and if it hangs, what the threads were doing.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I am not reporting a security vulnerability.
+          required: true
+        - label: I searched existing issues for a duplicate.
+          required: true
