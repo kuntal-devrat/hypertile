@@ -354,7 +354,10 @@ impl PyNativeTask {
         let py = slf.py();
         let wrapped = wrap_done_callback(py, cb, slf.clone().into_any().unbind())?;
         add_completion_callback(py, wrapped, &slf.borrow().inner.callbacks, || {
-            slf.borrow().inner.done.load(std::sync::atomic::Ordering::Acquire)
+            slf.borrow()
+                .inner
+                .done
+                .load(std::sync::atomic::Ordering::Acquire)
         })
     }
 
@@ -625,7 +628,10 @@ impl PyCallableTask {
         let py = slf.py();
         let wrapped = wrap_done_callback(py, cb, slf.clone().into_any().unbind())?;
         add_completion_callback(py, wrapped, &slf.borrow().inner.callbacks, || {
-            slf.borrow().inner.done.load(std::sync::atomic::Ordering::Acquire)
+            slf.borrow()
+                .inner
+                .done
+                .load(std::sync::atomic::Ordering::Acquire)
         })
     }
 

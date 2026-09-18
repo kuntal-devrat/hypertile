@@ -1,5 +1,6 @@
 {
-  "include": ["python", "tests", "examples", "benches", "showcase"],
+  "include": ["python", "tests"],
+  "exclude": [".venv*", "target", "examples", "showcase", "benches"],
   "extraPaths": ["python"],
   "venvPath": ".",
   "venv": ".venv"

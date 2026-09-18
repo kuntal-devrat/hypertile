@@ -70,13 +70,12 @@ impl Runnable for PyCoroutineTask {
 
             // 2. Step the coroutine via send(val) or throw(exc) under catch_unwind
             let next_input = self.pending_value.lock().take();
-            let unwind_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match next_input {
+            let unwind_res =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match next_input {
                     Some(Ok(val)) => coro.call_method1("send", (val.bind(py),)),
                     Some(Err(err)) => coro.call_method1("throw", (err.bind(py),)),
                     None => coro.call_method1("send", (py.None(),)),
-                }
-            }));
+                }));
 
             let step_result = match unwind_res {
                 Ok(res) => res,
@@ -90,10 +89,7 @@ impl Runnable for PyCoroutineTask {
                         "coroutine panicked during execution".to_string()
                     };
                     if let Some(cb) = self.done_callback.lock().take() {
-                        let _ = cb.call1(
-                            py,
-                            (py.None(), PanicInTask::new_err(msg)),
-                        );
+                        let _ = cb.call1(py, (py.None(), PanicInTask::new_err(msg)));
                     }
                     return;
                 }
@@ -128,7 +124,9 @@ impl Runnable for PyCoroutineTask {
                                             *task_clone.pending_value.lock() =
                                                 Some(Ok(res.into_any().unbind()));
                                         }
-                                    } else if let Ok(res) = yielded_clone.bind(py).call_method0("result") {
+                                    } else if let Ok(res) =
+                                        yielded_clone.bind(py).call_method0("result")
+                                    {
                                         *task_clone.pending_value.lock() =
                                             Some(Ok(res.into_any().unbind()));
                                     }

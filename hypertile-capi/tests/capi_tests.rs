@@ -223,12 +223,8 @@ fn test_capi_batch_spawn_panic() {
         let args: Vec<*mut c_void> = (0..8).map(|i| i as *mut c_void).collect();
         let mut results: Vec<*mut c_void> = vec![std::ptr::null_mut(); 8];
 
-        let status = hypertile_batch_spawn(
-            Some(maybe_panic),
-            args.as_ptr(),
-            results.as_mut_ptr(),
-            8,
-        );
+        let status =
+            hypertile_batch_spawn(Some(maybe_panic), args.as_ptr(), results.as_mut_ptr(), 8);
         assert_eq!(status, HypertileStatus::ErrPanic as i32);
     }
 }

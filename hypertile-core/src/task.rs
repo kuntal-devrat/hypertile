@@ -21,7 +21,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use thiserror::Error;
 
-
 /// Kind of task: native Rust future or interpreter-bound Python coroutine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
